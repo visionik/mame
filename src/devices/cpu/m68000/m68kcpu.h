@@ -1312,8 +1312,25 @@ inline void m68ki_stack_frame_1000(u32 pc, u32 sr, u32 vector, u32 fault_address
 	/* FAULT ADDRESS */
 	m68ki_push_32(fault_address);
 
-	/* SPECIAL STATUS WORD */
-	m68ki_push_16(orig_fc | (orig_rw<<8));
+	/* SPECIAL STATUS WORD
+	 * 68010: RR=15, IF=13, DF=12, RM=11, HB=10, BY=9, RW=8, FC=2..0.
+	 * RR stays 0 so RTE reruns the cycle. Program FC 2/6 => IF, else DF.
+	 */
+	{
+		u16 ssw = u16(orig_fc & 7) | u16(orig_rw << 8);
+		u16 const fcl = u16(orig_fc & 7);
+		if (fcl == 2 || fcl == 6)
+			ssw |= 0x2000;
+		else
+			ssw |= 0x1000;
+		if (m_mmu_tmp_buserror_sz == M68K_SZ_BYTE)
+		{
+			ssw |= 0x0200;
+			if (fault_address & 1)
+				ssw |= 0x0400;
+		}
+		m68ki_push_16(ssw);
+	}
 
 	/* 1000, VECTOR OFFSET */
 	m68ki_push_16(0x8000 | (vector<<2));

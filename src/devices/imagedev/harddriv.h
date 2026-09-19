@@ -77,6 +77,7 @@ public:
 	const hard_disk_file::info &get_info() const;
 	bool read(uint32_t lbasector, void *buffer);
 	bool write(uint32_t lbasector, const void *buffer);
+	void set_geometry(uint32_t cylinders, uint32_t heads, uint32_t sectors);
 
 	bool set_block_size(uint32_t blocksize);
 

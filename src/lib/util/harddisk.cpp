@@ -149,11 +149,17 @@ bool hard_disk_file::write(uint32_t lbasector, const void *buffer)
 	}
 	else
 	{
+		std::uint64_t length = 0;
+		if (fhandle->length(length))
+			return false;
+		uint64_t const pos = uint64_t(fileoffset) + uint64_t(lbasector) * uint64_t(hdinfo.sectorbytes);
+		if (pos + hdinfo.sectorbytes > length)
+			return false;
 		size_t actual = 0;
-		std::error_condition err = fhandle->seek(fileoffset + (lbasector * hdinfo.sectorbytes), SEEK_SET);
+		std::error_condition err = fhandle->seek(pos, SEEK_SET);
 		if (!err)
 			std::tie(err, actual) = util::write(*fhandle, buffer, hdinfo.sectorbytes);
-		return !err;
+		return !err && (actual == hdinfo.sectorbytes);
 	}
 }
 

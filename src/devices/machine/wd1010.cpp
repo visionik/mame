@@ -62,7 +62,11 @@ wd1010_device::wd1010_device(const machine_config &mconfig, const char *tag, dev
 	m_sector_number(0x00),
 	m_cylinder(0x0000),
 	m_sdh(0x00),
-	m_status(0x00)
+	m_status(0x00),
+	m_cur_cyl(0),
+	m_cur_head(0),
+	m_cur_sec(0),
+	m_forced_lba(-1)
 {
 }
 
@@ -102,6 +106,10 @@ void wd1010_device::device_start()
 	save_item(NAME(m_sdh));
 	save_item(NAME(m_status));
 	save_item(NAME(m_head));
+	save_item(NAME(m_cur_cyl));
+	save_item(NAME(m_cur_head));
+	save_item(NAME(m_cur_sec));
+	save_item(NAME(m_forced_lba));
 }
 
 //-------------------------------------------------
@@ -110,6 +118,21 @@ void wd1010_device::device_start()
 
 void wd1010_device::device_reset()
 {
+	m_status = 0;
+	m_command = 0;
+	m_error = 0;
+	m_intrq = 0;
+	m_brdy = 0;
+	m_cur_cyl = 0;
+	m_cur_head = 0;
+	m_cur_sec = 0;
+	m_forced_lba = -1;
+	if (m_seek_timer)
+		m_seek_timer->adjust(attotime::never);
+	if (m_read_timer)
+		m_read_timer->adjust(attotime::never);
+	if (m_write_timer)
+		m_write_timer->adjust(attotime::never);
 }
 
 //-------------------------------------------------
@@ -247,6 +270,10 @@ void wd1010_device::start_command()
 	// now busy and command in progress, clear error
 	m_status |= STATUS_BSY;
 	m_status |= STATUS_CIP;
+	m_cur_cyl = m_cylinder;
+	m_cur_head = m_head;
+	m_cur_sec = uint8_t(m_sector_number & 0x1f);
+	m_forced_lba = -1;
 	set_error(0);
 
 	switch (m_command >> 4)
@@ -285,6 +312,12 @@ void wd1010_device::end_command()
 
 	m_status &= ~(STATUS_BSY | STATUS_CIP);
 
+	if (m_read_timer)
+		m_read_timer->adjust(attotime::never);
+	if (m_write_timer)
+		m_write_timer->adjust(attotime::never);
+
+	m_forced_lba = -1;
 	set_intrq(1);
 }
 
@@ -294,15 +327,18 @@ void wd1010_device::end_command()
 
 int wd1010_device::get_lbasector()
 {
+	if (m_forced_lba >= 0)
+		return m_forced_lba;
+
 	harddisk_image_device *file = m_drives[drive()].drive;
 	const auto &info = file->get_info();
 	int lbasector;
 
-	lbasector = m_cylinder;
+	lbasector = m_cur_cyl;
 	lbasector *= info.heads;
-	lbasector += head();
+	lbasector += m_cur_head;
 	lbasector *= info.sectors;
-	lbasector += m_sector_number;
+	lbasector += (m_cur_sec & 0x1f);
 
 	return lbasector;
 }
@@ -322,7 +358,20 @@ void wd1010_device::drdy_w(int state)
 
 void wd1010_device::brdy_w(int state)
 {
+	int const was = m_brdy;
 	m_brdy = state;
+	// BRDY is an asynchronous buffer-ready input. Polling it from a
+	// long timer lets the CPU issue the next bio (often a write) while
+	// a multi-sector read is still draining. Kick the in-flight command
+	// on the rising edge so the next sector or INTRQ follows the last DMA word.
+	if (!was && state && (m_status & STATUS_DRQ) && (m_status & STATUS_CIP))
+	{
+		uint8_t const cmd = uint8_t(m_command >> 4);
+		if (cmd == CMD_READ_SECTOR)
+			m_read_timer->adjust(attotime::zero);
+		else if (cmd == CMD_WRITE_SECTOR || cmd == CMD_WRITE_FORMAT)
+			m_write_timer->adjust(attotime::zero);
+	}
 }
 
 void wd1010_device::sc_w(int state)
@@ -376,7 +425,9 @@ uint8_t wd1010_device::read(offs_t offset)
 
 	case 5:
 		LOGREGS("RD CYLINDER H: %02x\n", m_cylinder >> 8);
-		return m_cylinder >> 8;
+		// WD2010-class: 11-bit cylinder, high register is 3 bits. UNIX
+		// 3.51 probes this width (bit 2 sticks) to print Disk Ctrlr=WD2010.
+		return uint8_t(m_cylinder >> 8) & 0x07;
 
 	case 6:
 		LOGREGS("RD SDH: %02x\n", m_sdh);
@@ -426,7 +477,7 @@ void wd1010_device::write(offs_t offset, uint8_t data)
 
 	case 5:
 		LOGREGS("WR CYLINDER H: %02x\n", data);
-		m_cylinder = (m_cylinder & 0x00ff) | (data << 8);
+		m_cylinder = (m_cylinder & 0x00ff) | (uint16_t(data & 0x07) << 8);
 		break;
 
 	case 6:
@@ -437,7 +488,10 @@ void wd1010_device::write(offs_t offset, uint8_t data)
 	case 7:
 		// writes to the command register are ignored when a command is in progress
 		if (m_status & STATUS_CIP)
+		{
+			logerror("wd1010 cmd %02x ignored (CIP)\n", data);
 			return;
+		}
 
 		// writing the command register clears the interrupt
 		set_intrq(0);
@@ -446,7 +500,7 @@ void wd1010_device::write(offs_t offset, uint8_t data)
 		if (!(m_status & STATUS_RDY))
 		{
 			// selected drive not ready
-			LOG("--> Drive not ready, aborting\n");
+			logerror("wd1010 cmd %02x abort not-ready status=%02x\n", data, m_status);
 
 			set_error(ERR_AC);
 			end_command();
@@ -485,7 +539,10 @@ void wd1010_device::write(offs_t offset, uint8_t data)
 			if ((m_command >> 4) != CMD_SCAN_ID)
 				LOGSEEK("Seeking %d cylinders to %d\n", seek, target);
 
-			m_seek_timer->adjust(get_stepping_rate() * abs(seek), target);
+			if (seek == 0)
+				update_seek(target);
+			else
+				m_seek_timer->adjust(get_stepping_rate() * abs(seek), target);
 		}
 
 		break;
@@ -531,6 +588,7 @@ void wd1010_device::cmd_read_sector()
 	// verify that the selected drive is there
 	if (file == nullptr || !file->exists())
 	{
+		logerror("wd1010 read: no drive (sdh drive=%d)\n", drive());
 		LOG("--> No drive selected, aborting\n");
 
 		set_error(ERR_AC);
@@ -543,6 +601,7 @@ void wd1010_device::cmd_read_sector()
 	// verify that we can read
 	if (head() > info.heads)
 	{
+		logerror("wd1010 read: head %d > %d\n", head(), info.heads);
 		// out of range
 		LOG("--> Head out of range, aborting\n");
 
@@ -569,6 +628,7 @@ void wd1010_device::cmd_read_sector()
 	if (BIT(m_command, 2))
 	{
 		m_sector_number++;
+		m_cur_sec = uint8_t((m_cur_sec + 1) & 0x1f);
 		m_sector_count--;
 	}
 	else
@@ -655,6 +715,7 @@ void wd1010_device::cmd_write_sector()
 	if (BIT(m_command, 2) && m_sector_count > 0)
 	{
 		m_sector_number++;
+		m_cur_sec = uint8_t((m_cur_sec + 1) & 0x1f);
 		m_sector_count--;
 
 		// schedule another run if we aren't finished yet

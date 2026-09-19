@@ -50,6 +50,7 @@ project("mametests")
 		MAME_DIR .. "src/osd",
 		MAME_DIR .. "src/emu",
 		MAME_DIR .. "src/lib/util",
+		MAME_DIR .. "src/mame/att",
 		ext_includedir("expat"),
 		ext_includedir("zlib"),
 	}
@@ -67,5 +68,6 @@ project("mametests")
 		MAME_DIR .. "tests/lib/util/options.cpp",
 		MAME_DIR .. "tests/emu/attotime.cpp",
 		MAME_DIR .. "tests/emu/video/rgbutil.cpp",
+		MAME_DIR .. "tests/mame/att/unixpc_mmu.cpp",
 	}
 
