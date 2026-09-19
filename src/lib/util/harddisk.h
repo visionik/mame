@@ -39,6 +39,13 @@ public:
 
 	const info &get_info() const { return hdinfo; }
 
+	void set_geometry(uint32_t cylinders, uint32_t heads, uint32_t sectors)
+	{
+		hdinfo.cylinders = cylinders;
+		hdinfo.heads = heads;
+		hdinfo.sectors = sectors;
+	}
+
 	bool set_block_size(uint32_t blocksize);
 
 	bool read(uint32_t lbasector, void *buffer);
