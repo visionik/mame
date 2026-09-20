@@ -50,11 +50,6 @@ public:
 	// works as if it does; this function allows heads beyond the 3-bit range of the sdh register.
 	void head_w(uint8_t head) { m_head = head; }
 
-	// Board glue (HDSEL3, consecutive 1K LBA) computes the 512-byte
-	// address. Force that LBA so a live task-file / MCR2 change during
-	// DMA cannot retarget the in-flight sector.
-	void force_lbasector(int lba) { m_forced_lba = lba; }
-
 protected:
 	// device-level overrides
 	virtual void device_start() override ATTR_COLD;
@@ -163,7 +158,6 @@ private:
 	uint16_t m_cur_cyl;
 	uint8_t m_cur_head;
 	uint8_t m_cur_sec;
-	int m_forced_lba;
 };
 
 // device type definition

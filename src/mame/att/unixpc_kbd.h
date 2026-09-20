@@ -64,6 +64,62 @@ public:
 
 	void mark_mouse() { m_last_was_mouse = true; }
 
+	static constexpr uint8_t LIST_END = 0x80;
+
+	// Currently-down makes, scancode order, LIST_END on the last byte.
+	static int fill_snapshot(uint32_t const now[4], uint8_t *out, int max)
+	{
+		int n = 0;
+		uint8_t last = 0;
+		bool have = false;
+		for (int bank = 0; bank < 4; bank++)
+		{
+			for (int bit = 0; bit < 32; bit++)
+			{
+				if ((now[bank] & (uint32_t(1) << bit)) == 0)
+					continue;
+				if (have && n < max)
+					out[n++] = last;
+				last = uint8_t(bank * 32 + bit);
+				have = true;
+			}
+		}
+		if (have && n < max)
+			out[n++] = uint8_t(last | LIST_END);
+		return n;
+	}
+
+	static bool any_down(uint32_t const now[4])
+	{
+		return (now[0] | now[1] | now[2] | now[3]) != 0;
+	}
+
+	// 0xCE, flags (dx>0:0x10, dy<0:0x08, buttons), |dx|, |dy||0x80.
+	// If Y==0xDF, duplicate it so the guest does not take it as kbd sync.
+	static int fill_mouse(int dx, int dy, uint8_t buttons, uint8_t *out)
+	{
+		uint8_t flags = uint8_t(buttons & 0x07);
+		if (dx > 0)
+			flags |= 0x10;
+		if (dy < 0)
+			flags |= 0x08;
+		int adx = dx < 0 ? -dx : dx;
+		int ady = dy < 0 ? -dy : dy;
+		if (adx > 127)
+			adx = 127;
+		if (ady > 127)
+			ady = 127;
+		uint8_t const yb = uint8_t(ady | 0x80);
+		out[0] = BEGIN_MOUSE;
+		out[1] = flags;
+		out[2] = uint8_t(adx);
+		out[3] = yb;
+		int n = 4;
+		if (yb == AFTER_MOUSE)
+			out[n++] = yb;
+		return n;
+	}
+
 private:
 	std::array<uint8_t, SIZE> m_buf{};
 	std::size_t m_head = 0, m_tail = 0, m_len = 0;

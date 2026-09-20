@@ -65,8 +65,7 @@ wd1010_device::wd1010_device(const machine_config &mconfig, const char *tag, dev
 	m_status(0x00),
 	m_cur_cyl(0),
 	m_cur_head(0),
-	m_cur_sec(0),
-	m_forced_lba(-1)
+	m_cur_sec(0)
 {
 }
 
@@ -109,7 +108,6 @@ void wd1010_device::device_start()
 	save_item(NAME(m_cur_cyl));
 	save_item(NAME(m_cur_head));
 	save_item(NAME(m_cur_sec));
-	save_item(NAME(m_forced_lba));
 }
 
 //-------------------------------------------------
@@ -126,7 +124,6 @@ void wd1010_device::device_reset()
 	m_cur_cyl = 0;
 	m_cur_head = 0;
 	m_cur_sec = 0;
-	m_forced_lba = -1;
 	if (m_seek_timer)
 		m_seek_timer->adjust(attotime::never);
 	if (m_read_timer)
@@ -273,7 +270,6 @@ void wd1010_device::start_command()
 	m_cur_cyl = m_cylinder;
 	m_cur_head = m_head;
 	m_cur_sec = uint8_t(m_sector_number & 0x1f);
-	m_forced_lba = -1;
 	set_error(0);
 
 	switch (m_command >> 4)
@@ -317,7 +313,6 @@ void wd1010_device::end_command()
 	if (m_write_timer)
 		m_write_timer->adjust(attotime::never);
 
-	m_forced_lba = -1;
 	set_intrq(1);
 }
 
@@ -327,9 +322,6 @@ void wd1010_device::end_command()
 
 int wd1010_device::get_lbasector()
 {
-	if (m_forced_lba >= 0)
-		return m_forced_lba;
-
 	harddisk_image_device *file = m_drives[drive()].drive;
 	const auto &info = file->get_info();
 	int lbasector;
@@ -489,7 +481,7 @@ void wd1010_device::write(offs_t offset, uint8_t data)
 		// writes to the command register are ignored when a command is in progress
 		if (m_status & STATUS_CIP)
 		{
-			logerror("wd1010 cmd %02x ignored (CIP)\n", data);
+			LOG("wd1010 cmd %02x ignored (CIP)\n", data);
 			return;
 		}
 
