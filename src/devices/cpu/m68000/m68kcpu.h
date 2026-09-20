@@ -688,8 +688,52 @@ inline u32 m68ki_read_imm_32()
  * These functions will also check for address error and set the function
  * code if they are enabled in m68kconf.h.
  */
+inline void m68ki_rerun_expire()
+{
+	if (m_rerun_count != 0 && m_ppc != m_rerun_pc)
+		m_rerun_count = 0;
+}
+
+inline void m68ki_rerun_supply(u32 pc, u16 ssw, u32 address, u16 dib)
+{
+	u32 size = (ssw & 0x0200) ? 1 : 2;
+	u32 data = dib;
+	if (size == 1)
+		data = (ssw & 0x0400) ? ((dib >> 8) & 0xff) : (dib & 0xff);
+	if (m_rerun_count != 0 && m_rerun_pc != pc)
+		m_rerun_count = 0;
+	m_rerun_pc = pc;
+	if (m_rerun_count == M68K_RERUN_ENTRIES)
+	{
+		for (int i = 1; i < M68K_RERUN_ENTRIES; i++)
+			m_rerun[i - 1] = m_rerun[i];
+		m_rerun_count--;
+	}
+	m_rerun[m_rerun_count].address = address;
+	m_rerun[m_rerun_count].size = size;
+	m_rerun[m_rerun_count].data = data;
+	m_rerun[m_rerun_count].write = (ssw & 0x0100) ? 0 : 1;
+	m_rerun_count++;
+}
+
+inline bool m68ki_rerun_match(u32 address, u32 size, u32 write, u32 &data)
+{
+	for (u32 i = 0; i < m_rerun_count; i++)
+	{
+		if (m_rerun[i].address == address && m_rerun[i].size == size && m_rerun[i].write == write)
+		{
+			data = m_rerun[i].data;
+			return true;
+		}
+	}
+	return false;
+}
+
 inline u32 m68ki_read_8_fc(u32 address, u32 fc)
 {
+	u32 supplied;
+	if (m68ki_rerun_match(address, 1, 0, supplied))
+		return supplied;
 	m_mmu_tmp_fc = fc;
 	m_mmu_tmp_rw = 1;
 	m_mmu_tmp_sz = M68K_SZ_BYTE;
@@ -707,6 +751,9 @@ inline u32 m68ki_read_8_fc(u32 address, u32 fc)
 }
 inline u32 m68ki_read_16_fc(u32 address, u32 fc)
 {
+	u32 supplied;
+	if (m68ki_rerun_match(address, 2, 0, supplied))
+		return supplied;
 	if (CPU_TYPE_IS_010_LESS())
 	{
 		m68ki_check_address_error(address, MODE_READ, fc);
@@ -1325,8 +1372,9 @@ inline void m68ki_stack_frame_1000(u32 pc, u32 sr, u32 vector, u32 fault_address
 			ssw |= 0x1000;
 		if (m_mmu_tmp_buserror_sz == M68K_SZ_BYTE)
 		{
-			ssw |= 0x0200;
-			if (fault_address & 1)
+			ssw |= 0x0200; // BY
+			// Even byte uses D15-D8 (HB=1); odd byte uses D7-D0 (HB=0).
+			if ((fault_address & 1) == 0)
 				ssw |= 0x0400;
 		}
 		m68ki_push_16(ssw);

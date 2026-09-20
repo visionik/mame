@@ -71,6 +71,26 @@ inline uint16_t dma_genstat(bool dma_from_memory, bool pie)
 	return g;
 }
 
+// 68010 format-8 SSW: RR=15, IF=13, DF=12, RM=11, HB=10, BY=9, RW=8, FC=2..0.
+// Even byte uses D15-D8 (HB=1). RR stays 0 so RTE reruns the cycle.
+inline uint16_t ssw_68010(unsigned fc, bool read, bool is_byte, bool even_addr)
+{
+	uint16_t s = uint16_t(fc & 7);
+	if (read)
+		s |= 0x0100;
+	if ((fc & 7) == 2 || (fc & 7) == 6)
+		s |= 0x2000;
+	else
+		s |= 0x1000;
+	if (is_byte)
+	{
+		s |= 0x0200;
+		if (even_addr)
+			s |= 0x0400;
+	}
+	return s;
+}
+
 inline uint16_t cpu_bsr0(uint32_t addr, int width_bits, bool privileged)
 {
 	uint16_t b;
