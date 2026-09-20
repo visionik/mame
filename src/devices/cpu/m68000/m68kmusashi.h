@@ -123,6 +123,7 @@ public:
 	void set_fpu_enable(bool enable);
 	bool get_fpu_enable() const { return m_has_fpu; }
 	void set_buserror_details(u32 fault_addr, u8 rw, u8 fc, bool rerun = false);
+	u16 get_access_sz() const noexcept { return m_mmu_tmp_sz; }
 	void restart_this_instruction();
 
 protected:
@@ -175,6 +176,18 @@ protected:
 	bool m_can_instruction_restart; /* Save DA regs for potential instruction restart */
 	bool m_fpu_just_reset; /* Indicates the FPU was just reset */
 	bool m_restart_instruction; /* Indicates the instruction should be restarted */
+
+	// 68010 format-8 RR=1: handler already ran the faulted cycle (DIB).
+	static constexpr int M68K_RERUN_ENTRIES = 2;
+	u32 m_rerun_pc;
+	u32 m_rerun_count;
+	struct
+	{
+		u32 address;
+		u32 size;
+		u32 data;
+		u32 write;
+	} m_rerun[M68K_RERUN_ENTRIES];
 
 	/* Clocks required for instructions / exceptions */
 	u32 m_cyc_bcc_notake_b;

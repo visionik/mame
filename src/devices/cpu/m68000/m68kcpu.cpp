@@ -922,6 +922,7 @@ void m68000_musashi_device::execute_run()
 
 			/* Record previous program counter */
 			m_ppc = m_pc;
+			m68ki_rerun_expire();
 
 			/* Call external hook to peek at CPU */
 			debugger_instruction_hook(m_pc);
@@ -1142,11 +1143,12 @@ void m68000_musashi_device::init_cpu_common(void)
 
 void m68000_musashi_device::device_reset()
 {
-	/* Disable the PMMU/HMMU on reset, if any */
+	/* Disable the on-chip PMMU/HMMU on reset. External MMU (emmu) is
+	 * board glue, not a CPU reset bit; keep it and recompute restart. */
 	m_pmmu_enabled = false;
 	m_hmmu_enabled = 0;
-	m_emmu_enabled = false;
-	m_can_instruction_restart = false;
+	m_can_instruction_restart = m_pmmu_enabled || m_emmu_enabled;
+	m_rerun_count = 0;
 
 	if (m_has_fpu)
 	{
@@ -2702,6 +2704,8 @@ void m68000_musashi_device::clear_all()
 	m_mmu_tmp_buserror_address = 0;
 	m_mmu_tmp_buserror_occurred = false;
 	m_restart_instruction = false;
+	m_rerun_pc = 0;
+	m_rerun_count = 0;
 	m_mmu_tmp_buserror_fc = 0;
 	m_mmu_tmp_buserror_rw = 0;
 

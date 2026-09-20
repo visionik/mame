@@ -20,6 +20,7 @@
 #include "unixpc_dma.h"
 #include "unixpc_rtc.h"
 #include "unixpc_hdc.h"
+#include "unixpc_kbd.h"
 
 #include <array>
 #include <cstdint>
@@ -136,6 +137,14 @@ TEST_CASE("unixpc cpu fault encoding", "[unixpc]")
 
 	r = unixpc::encode_cpu_fault(fault_kind::kernel_or_protect, false, 0x00000000, 16, false);
 	REQUIRE(r.genstat == 0x51ff);
+
+	// TST.B (A0=0): even byte, not a word. BSR lane 0x7d00, SSW $1701.
+	r = unixpc::encode_cpu_fault(fault_kind::kernel_or_protect, false, 0x00000000, 8, false);
+	REQUIRE(r.genstat == 0x51ff);
+	REQUIRE((r.bsr0 & 0xff00) == 0x7d00);
+	REQUIRE(unixpc::ssw_68010(1, true, true, true) == 0x1701);
+	REQUIRE(unixpc::ssw_68010(1, true, true, false) == 0x1301);
+	REQUIRE((unixpc::ssw_68010(1, true, true, true) | 0x8000) == 0x9701);
 
 	// User write miss at 0x09A000 must keep 0x09 in BSR0 so pagein
 	// does not treat it as kernel VA 0xA000.
@@ -264,6 +273,10 @@ TEST_CASE("unixpc winchester LBA is 1400/16/17 0-based", "[unixpc]")
 	REQUIRE(unixpc::winchester_lba_next(unixpc::winchester_lba(0, 0, 16))
 		== unixpc::winchester_lba(0, 1, 0));
 	REQUIRE(unixpc::winchester_lba(1399, 15, 17) == ~uint32_t(0));
+	// Extra head pin is 8; a live-at-BRDY decode that drops it moves
+	// LBA by one head-bank (8 * 17).
+	REQUIRE(unixpc::winchester_lba(32, 13, 10) - unixpc::winchester_lba(32, 5, 10)
+		== 8u * unixpc::WINCH_SPT);
 }
 
 TEST_CASE("unixpc hdc dma slices are 20 words at 1 MHz", "[unixpc]")
@@ -275,4 +288,40 @@ TEST_CASE("unixpc hdc dma slices are 20 words at 1 MHz", "[unixpc]")
 	REQUIRE(unixpc::hdc_dma_slices(21) == 2);
 	REQUIRE(unixpc::hdc_dma_slices(256) == 13);
 	REQUIRE(unixpc::hdc_dma_slices(512) == 26);
+}
+
+TEST_CASE("unixpc kbd snapshot is change-triggered makes with EOL", "[unixpc]")
+{
+	uint32_t now[4] = { 0, 0, 0, 0 };
+	uint8_t buf[8];
+	REQUIRE(unixpc::kbd_queue::fill_snapshot(now, buf, 8) == 0);
+	REQUIRE_FALSE(unixpc::kbd_queue::any_down(now));
+
+	now[3] = uint32_t(1) << 18; // R = bank3 bit 18 = 0x72
+	int n = unixpc::kbd_queue::fill_snapshot(now, buf, 8);
+	REQUIRE(n == 1);
+	REQUIRE(buf[0] == uint8_t(0x72 | 0x80));
+
+	now[2] = uint32_t(1) << 8; // Shift 0x48
+	n = unixpc::kbd_queue::fill_snapshot(now, buf, 8);
+	REQUIRE(n == 2);
+	REQUIRE(buf[0] == 0x48);
+	REQUIRE(buf[1] == uint8_t(0x72 | 0x80));
+}
+
+TEST_CASE("unixpc mouse packet CE flags dx dy", "[unixpc]")
+{
+	uint8_t p[5];
+	int n = unixpc::kbd_queue::fill_mouse(3, -2, 0x04, p);
+	REQUIRE(n == 4);
+	REQUIRE(p[0] == 0xce);
+	REQUIRE((p[1] & 0x10) != 0);
+	REQUIRE((p[1] & 0x08) != 0);
+	REQUIRE((p[1] & 0x04) != 0);
+	REQUIRE(p[2] == 3);
+	REQUIRE(p[3] == uint8_t(2 | 0x80));
+	n = unixpc::kbd_queue::fill_mouse(0, 0x5f, 0, p);
+	REQUIRE(n == 5);
+	REQUIRE(p[3] == 0xdf);
+	REQUIRE(p[4] == 0xdf);
 }
