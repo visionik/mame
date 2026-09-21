@@ -33,6 +33,7 @@ public:
 	}
 
 	bool empty() const { return m_len == 0; }
+	std::size_t size() const { return m_len; }
 
 	void push(uint8_t b)
 	{
