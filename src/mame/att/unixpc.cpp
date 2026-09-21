@@ -177,6 +177,7 @@ private:
 	void kbd_scan();
 	void kbd_shift_bit();
 	void hdc_apply_head();
+	void unixpc_bind_ui_menu();
 #if UNIXPC_BERR_TRACE
 	void berr_trace(char const *ev, uint32_t fa, uint16_t ssw);
 	uint16_t peek_super16(uint32_t addr);
@@ -256,7 +257,11 @@ private:
 	int m_mouse_lx = 0;
 	int m_mouse_ly = 0;
 	uint8_t m_mouse_lb = 0;
+	uint8_t m_mouse_sent_b = 0;
+	int m_mouse_pdx = 0;
+	int m_mouse_pdy = 0;
 	bool m_mouse_inited = false;
+	bool m_uncap_held = false;
 	uint16_t m_kbd_shift = 0;
 	int m_kbd_bits = 0;
 	int m_kbd_cell = 0;
@@ -575,6 +580,23 @@ void unixpc_state::ram_phys_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 		COMBINE_DATA(&m_ramptr[offset]);
 }
 
+void unixpc_state::unixpc_bind_ui_menu()
+{
+	// Tab/Ctrl/F12 are either the 3B1 keyboard or stolen by macOS.
+	// F10 is not a 3B1 key.
+	// Keyboard machines start with UI disabled; only TOGGLE is polled.
+	// Tab/Ctrl/F-keys are the 3B1 or macOS. Command+Shift+U (Mac) enables
+	// UI; then Tab opens the menu. Esc while UI is on is Back, not 3B1 Esc.
+	machine().ioport().set_type_seq(IPT_UI_TOGGLE_UI, 0, SEQ_TYPE_STANDARD,
+		input_seq(KEYCODE_LWIN, KEYCODE_LSHIFT, KEYCODE_U,
+			input_seq::or_code, KEYCODE_RWIN, KEYCODE_RSHIFT, KEYCODE_U));
+	machine().ioport().set_type_seq(IPT_UI_MENU, 0, SEQ_TYPE_STANDARD, input_seq(KEYCODE_TAB));
+	machine().ioport().set_type_seq(IPT_UI_RELEASE_POINTER, 0, SEQ_TYPE_STANDARD,
+		input_seq(KEYCODE_LWIN, KEYCODE_LSHIFT, KEYCODE_M,
+			input_seq::or_code, KEYCODE_RWIN, KEYCODE_RSHIFT, KEYCODE_M));
+	logerror("UI_TOGGLE Cmd+Shift+U, UI_MENU Tab, UI_RELEASE_POINTER Cmd+Shift+M\n");
+}
+
 void unixpc_state::machine_start()
 {
 	m_ramptr = m_ram->pointer<uint16_t>();
@@ -600,6 +622,8 @@ void unixpc_state::machine_start()
 	save_item(NAME(m_hdc_buf));
 	save_item(NAME(m_hdc_pos));
 	UNIXPC_LOG("hdd exists=%d size=%u\n", int(m_hdr0->exists()), unsigned(m_ramsize));
+
+	unixpc_bind_ui_menu();
 }
 
 void unixpc_state::machine_reset()
@@ -611,6 +635,9 @@ void unixpc_state::machine_reset()
 	m_key_stable = 0;
 	m_keys_held = false;
 	m_mouse_inited = false;
+	m_mouse_pdx = 0;
+	m_mouse_pdy = 0;
+	m_mouse_sent_b = 0;
 	m_kbd_bits = 0;
 	m_kbd_cell = 0;
 	m_kbd_rxd = true;
@@ -634,6 +661,7 @@ void unixpc_state::machine_reset()
 	m_kbc->write_cts(0);
 	m_kbc->write_dcd(0);
 	m_maincpu->set_emmu_enable(true);
+	unixpc_bind_ui_menu();
 	disk_control_w(0);
 	m_board.set_clrsint_high(false);
 	m_maincpu->set_input_line(M68K_IRQ_6, CLEAR_LINE);
@@ -659,6 +687,27 @@ void unixpc_state::vblank_w(int state)
 {
 	if (!state)
 		return;
+
+	{
+		static bool once;
+		if (!once)
+		{
+			once = true;
+			machine().popmessage("MAME UI: Cmd+Shift+U then Tab  |  uncapture: Cmd+Shift+M");
+		}
+	}
+
+	// IPT_UI_RELEASE_POINTER is not polled by the core. Pause so the
+	// OSD drops capture (should_hide_mouse is false while paused).
+	bool const uncap = machine().ioport().type_pressed(IPT_UI_RELEASE_POINTER);
+	if (uncap && !m_uncap_held)
+	{
+		if (machine().paused())
+			machine().resume();
+		else
+			machine().pause();
+	}
+	m_uncap_held = uncap;
 
 	m_board.vblank();
 	bool const irq6 = m_board.timer_latched();
@@ -1311,39 +1360,44 @@ void unixpc_state::kbd_scan()
 		}
 	}
 
-	int const mx = int(m_mouse_x->read() & 0xff);
-	int const my = int(m_mouse_y->read() & 0xff);
+	s16 const sx = s16(m_mouse_x->read());
+	s16 const sy = s16(m_mouse_y->read());
 	uint8_t const mb = uint8_t(m_mouse_b->read() & 0x07);
 	if (!m_mouse_inited)
 	{
-		m_mouse_lx = mx;
-		m_mouse_ly = my;
+		m_mouse_lx = sx;
+		m_mouse_ly = sy;
 		m_mouse_lb = mb;
 		m_mouse_inited = true;
 	}
 	else
 	{
-		int dx = mx - m_mouse_lx;
-		int dy = my - m_mouse_ly;
-		if (dx > 127)
-			dx -= 256;
-		if (dx < -128)
-			dx += 256;
-		if (dy > 127)
-			dy -= 256;
-		if (dy < -128)
-			dy += 256;
-		if (dx != 0 || dy != 0 || mb != m_mouse_lb)
+		m_mouse_pdx += int(sx) - m_mouse_lx;
+		m_mouse_pdy += int(sy) - m_mouse_ly;
+		m_mouse_lx = sx;
+		m_mouse_ly = sy;
+		m_mouse_lb = mb;
+		// 1200 baud ≈ one 4-byte mouse packet per 37 ms. Queueing a
+		// packet every vblank overruns the 6850 and the pointer keeps
+		// moving after the hand stops. Coalesce until the UART is idle.
+		if (m_kbd.empty() && m_kbd_bits == 0
+			&& (m_mouse_pdx != 0 || m_mouse_pdy != 0 || mb != m_mouse_sent_b))
 		{
+			int sdx = m_mouse_pdx;
+			int sdy = m_mouse_pdy;
+			if (sdx > 127) sdx = 127;
+			if (sdx < -127) sdx = -127;
+			if (sdy > 127) sdy = 127;
+			if (sdy < -127) sdy = -127;
 			uint8_t pkt[5];
-			int const n = unixpc::kbd_queue::fill_mouse(dx, dy, mb, pkt);
+			int const n = unixpc::kbd_queue::fill_mouse(sdx, sdy, mb, pkt);
 			for (int i = 0; i < n; i++)
 				m_kbd.push(pkt[i]);
 			m_kbd.mark_mouse();
-			m_mouse_lb = mb;
+			m_mouse_pdx -= sdx;
+			m_mouse_pdy -= sdy;
+			m_mouse_sent_b = mb;
 		}
-		m_mouse_lx = mx;
-		m_mouse_ly = my;
 	}
 }
 
@@ -1545,9 +1599,9 @@ static INPUT_PORTS_START( unixpc )
 	PORT_CONFSETTING(0x02, "Amber")
 
 	PORT_START("MOUSEX")
-	PORT_BIT(0xff, 0x00, IPT_MOUSE_X) PORT_SENSITIVITY(50) PORT_KEYDELTA(0)
+	PORT_BIT(0xffff, 0x0000, IPT_MOUSE_X) PORT_SENSITIVITY(40) PORT_KEYDELTA(0)
 	PORT_START("MOUSEY")
-	PORT_BIT(0xff, 0x00, IPT_MOUSE_Y) PORT_SENSITIVITY(50) PORT_KEYDELTA(0)
+	PORT_BIT(0xffff, 0x0000, IPT_MOUSE_Y) PORT_SENSITIVITY(40) PORT_KEYDELTA(0)
 	PORT_START("MOUSEB")
 	PORT_BIT(0x04, IP_ACTIVE_HIGH, IPT_BUTTON1) PORT_CODE(MOUSECODE_BUTTON1) PORT_NAME("Mouse Left")
 	PORT_BIT(0x01, IP_ACTIVE_HIGH, IPT_BUTTON2) PORT_CODE(MOUSECODE_BUTTON2) PORT_NAME("Mouse Right")
