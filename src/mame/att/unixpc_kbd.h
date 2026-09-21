@@ -97,6 +97,25 @@ public:
 
 	// 0xCE, flags (dx>0:0x10, dy<0:0x08, buttons), |dx|, |dy||0x80.
 	// If Y==0xDF, duplicate it so the guest does not take it as kbd sync.
+	static int clamp_delta(int d)
+	{
+		if (d > 127)
+			return 127;
+		if (d < -127)
+			return -127;
+		return d;
+	}
+
+	// accel_centi is 50..300 for 0.5x..3.0x
+	static int scale_delta(int d, int accel_centi)
+	{
+		if (accel_centi < 50)
+			accel_centi = 50;
+		if (accel_centi > 300)
+			accel_centi = 300;
+		return clamp_delta((d * accel_centi) / 100);
+	}
+
 	static int fill_mouse(int dx, int dy, uint8_t buttons, uint8_t *out)
 	{
 		uint8_t flags = uint8_t(buttons & 0x07);
