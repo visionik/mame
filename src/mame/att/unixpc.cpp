@@ -36,7 +36,10 @@
 #include "machine/z80sio.h"
 
 #include "emupal.h"
+#include "render.h"
 #include "screen.h"
+#include "speaker.h"
+#include "sound/beep.h"
 
 #include "unixpc.lh"
 #include "unixpc_dma.h"
@@ -45,12 +48,12 @@
 #include "unixpc_kbd.h"
 #include "unixpc_mmu.h"
 #include "unixpc_rtc.h"
+#include "unixpc_sound.h"
+#include "unixpc_video.h"
 
 #include <algorithm>
 #include <cstdio>
 
-// Extra traces (vblank, map, fault, HDC command). Off unless built with
-// -DUNIXPC_EXTRA_LOG=1. Drive telemetry is a separate switch.
 #ifndef UNIXPC_EXTRA_LOG
 #define UNIXPC_EXTRA_LOG 0
 #endif
@@ -63,11 +66,9 @@
 #ifndef UNIXPC_BERR_TRACE
 #define UNIXPC_BERR_TRACE 0
 #endif
-#if UNIXPC_EXTRA_LOG
-#define UNIXPC_LOG(...) logerror(__VA_ARGS__)
-#else
-#define UNIXPC_LOG(...) do { } while (0)
-#endif
+
+#define VERBOSE (0)
+#include "logmacro.h"
 
 
 /***************************************************************************
@@ -96,7 +97,11 @@ public:
 		m_mouse_y(*this, "MOUSEY"),
 		m_mouse_b(*this, "MOUSEB"),
 		m_phosphor(*this, "PHOSPHOR"),
+		m_mouse_acc(*this, "MOUSEACC"),
+		m_winscale(*this, "WINSCALE"),
 		m_palette(*this, "palette"),
+		m_beep_lo(*this, "beep_lo"),
+		m_beep_hi(*this, "beep_hi"),
 		m_ramromview(*this, "ramromview"),
 		m_mapram(*this, "mapram"),
 		m_videoram(*this, "videoram"),
@@ -139,7 +144,7 @@ private:
 	uint16_t bsr1_r();
 	void csr_w(uint16_t data);
 	uint16_t csr_r();
-	void mcr2_w(uint16_t data);
+	void mcr2_w(offs_t offset, uint16_t data, uint16_t mem_mask = ~0);
 
 	void wd2797_intrq_w(int state);
 	void wd2797_drq_w(int state);
@@ -205,7 +210,11 @@ private:
 	required_ioport m_mouse_y;
 	required_ioport m_mouse_b;
 	required_ioport m_phosphor;
+	required_ioport m_mouse_acc;
+	required_ioport m_winscale;
 	required_device<palette_device> m_palette;
+	required_device<beep_device> m_beep_lo;
+	required_device<beep_device> m_beep_hi;
 	memory_view m_ramromview;
 
 	required_shared_ptr<uint16_t> m_mapram;
@@ -230,9 +239,10 @@ private:
 	uint8_t m_hdc_buf[512]{};
 	int m_hdc_pos = 0;
 	bool m_fdc_drq = false;
-	bool m_mcr2_mirror = false;
+
 	uint8_t m_hdc_head_low = 0;
 	bool m_hdc_head4 = false;
+	bool m_mcr2_p51 = false;
 	uint16_t m_hdc_cyl = 0;
 	uint8_t m_hdc_sector = 0;
 	uint8_t m_hdc_seccnt = 0;
@@ -262,6 +272,8 @@ private:
 	int m_mouse_pdy = 0;
 	bool m_mouse_inited = false;
 	bool m_uncap_held = false;
+	int m_win_view = -1;
+	uint16_t m_dialer_word = 0;
 	uint16_t m_kbd_shift = 0;
 	int m_kbd_bits = 0;
 	int m_kbd_cell = 0;
@@ -291,14 +303,14 @@ void unixpc_state::mapram_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 	COMBINE_DATA(&m_mapram[offset]);
 #if UNIXPC_EXTRA_LOG
 	if (old != m_mapram[offset])
-		UNIXPC_LOG("map[%03x] %04x->%04x pc=%06x\n",
+		LOG("map[%03x] %04x->%04x pc=%06x\n",
 			unsigned(offset), old, m_mapram[offset], unsigned(m_maincpu->pc()));
 #endif
 }
 
 void unixpc_state::romlmap_w(int state)
 {
-	UNIXPC_LOG("romlmap %d pc=%06x\n", state, unsigned(m_maincpu->pc()));
+	LOG("romlmap %d pc=%06x\n", state, unsigned(m_maincpu->pc()));
 	m_ramromview.select(state ? 1 : 0);
 }
 
@@ -312,7 +324,7 @@ void unixpc_state::apply_cpu_fault(unixpc::access result, uint32_t logical, bool
 	// Latch GSR/BSR on the first miss only (nested must not refresh).
 	bool const latched = m_board.latch_cpu(enc);
 	u16 const fc = m_maincpu->get_fc();
-	UNIXPC_LOG("cpu fault res=%d addr=%06x wr=%d pc=%06x fc=%u latch=%d gsr=%04x\n",
+	LOG("cpu fault res=%d addr=%06x wr=%d pc=%06x fc=%u latch=%d gsr=%04x\n",
 		int(result), logical, int(write), unsigned(m_maincpu->pc()),
 		unsigned(fc), int(latched), m_board.regs().genstat);
 	(void)latched;
@@ -621,7 +633,7 @@ void unixpc_state::machine_start()
 	save_item(NAME(m_fdc_drq));
 	save_item(NAME(m_hdc_buf));
 	save_item(NAME(m_hdc_pos));
-	UNIXPC_LOG("hdd exists=%d size=%u\n", int(m_hdr0->exists()), unsigned(m_ramsize));
+	LOG("hdd exists=%d size=%u\n", int(m_hdr0->exists()), unsigned(m_ramsize));
 
 	unixpc_bind_ui_menu();
 }
@@ -638,6 +650,7 @@ void unixpc_state::machine_reset()
 	m_mouse_pdx = 0;
 	m_mouse_pdy = 0;
 	m_mouse_sent_b = 0;
+	m_dialer_word = 0;
 	m_kbd_bits = 0;
 	m_kbd_cell = 0;
 	m_kbd_rxd = true;
@@ -653,10 +666,12 @@ void unixpc_state::machine_reset()
 	m_hdc_log_lba = ~uint32_t(0);
 #endif
 	m_fdc_drq = false;
+	m_mcr2_p51 = false;
+	m_hdc_head4 = false;
 	if (m_hdr0->exists())
 	{
 		m_hdr0->set_geometry(unixpc::WINCH_CYLS, unixpc::WINCH_HEADS, unixpc::WINCH_SPT);
-		UNIXPC_LOG("hdd geom %u/%u/%u\n", unixpc::WINCH_CYLS, unixpc::WINCH_HEADS, unixpc::WINCH_SPT);
+		LOG("hdd geom %u/%u/%u\n", unixpc::WINCH_CYLS, unixpc::WINCH_HEADS, unixpc::WINCH_SPT);
 	}
 	m_kbc->write_cts(0);
 	m_kbc->write_dcd(0);
@@ -680,7 +695,7 @@ void unixpc_state::parity_enable_w(int state)
 
 void unixpc_state::bpplus_w(int state)
 {
-	UNIXPC_LOG("bpplus %d pc=%06x\n", state, unsigned(m_maincpu->pc()));
+	LOG("bpplus %d pc=%06x\n", state, unsigned(m_maincpu->pc()));
 }
 
 void unixpc_state::vblank_w(int state)
@@ -709,6 +724,18 @@ void unixpc_state::vblank_w(int state)
 	}
 	m_uncap_held = uncap;
 
+	int const view = int(m_winscale->read() & 3);
+	if (view != m_win_view)
+	{
+		static char const *const view_name[] = {
+			"1.5x (1080x522)", "2x (1440x696)", "2.5x (1800x870)", "3x (2160x1044)"
+		};
+		m_win_view = view;
+		render_target *const target = machine().render().first_target();
+		if (target != nullptr)
+			target->set_view(target->configured_view(view_name[view], 0, 1));
+	}
+
 	m_board.vblank();
 	bool const irq6 = m_board.timer_latched();
 	m_maincpu->set_input_line(M68K_IRQ_6, irq6 ? ASSERT_LINE : CLEAR_LINE);
@@ -731,7 +758,7 @@ bool unixpc_state::dma_store_word(uint16_t word)
 	unixpc::probe const p = m_mapper.translate(logical, true, true, true);
 	if (p.result != unixpc::access::ok)
 	{
-		UNIXPC_LOG("dma store fault addr=%06x result=%d\n", logical, int(p.result));
+		LOG("dma store fault addr=%06x result=%d\n", logical, int(p.result));
 		if (m_board.latch_dma(unixpc::encode_dma_fault(false, logical, m_board.pie())))
 			nmi_update();
 		return false;
@@ -917,15 +944,25 @@ uint16_t unixpc_state::csr_r()
 	return 0;
 }
 
-void unixpc_state::mcr2_w(uint16_t data)
+void unixpc_state::mcr2_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 {
-	// Word write: HDSEL3 is D0, P5.1 detect is D4. An 8-bit store to
-	// the even address puts those bits in D8-D15 instead.
-	uint8_t const v = uint8_t(data | (data >> 8));
-	m_mcr2_mirror = BIT(v, 4);
-	m_hdc_head4 = BIT(v, 0);
+	// Working 3B1: MCR2 D4 is a PAL latch mirrored on TSR D4. The
+	// probe is BSET the shadow, MOVE.W to $E20000, BTST.B #4,$450001,
+	// then ANDI the bit off and BTST again (must read 0). HDSEL3 is D0.
+	// A full-word store replaces both bits; do not leave D4 stuck at 1.
+	(void)offset;
+	if (mem_mask & 0x00ff)
+	{
+		m_hdc_head4 = BIT(data, 0);
+		m_mcr2_p51 = BIT(data, 4);
+	}
+	else if (mem_mask & 0xff00)
+	{
+		m_hdc_head4 = BIT(data, 8);
+		m_mcr2_p51 = BIT(data, 12);
+	}
 	hdc_apply_head();
-	UNIXPC_LOG("mcr2 %04x hdsel3=%d pal=%d\n", data, int(m_hdc_head4), int(m_mcr2_mirror));
+	LOG("mcr2 %04x mask=%04x hdsel3=%d p51=%d\n", data, mem_mask, int(m_hdc_head4), int(m_mcr2_p51));
 }
 
 uint16_t unixpc_state::modem_r(offs_t offset)
@@ -946,10 +983,23 @@ void unixpc_state::modem_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 
 void unixpc_state::dialer_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 {
-	// 838A / RS-232 baud: payload is on A1-A8, data bus ignored.
-	(void)offset;
+	// 838A: payload on A1-A8 (word offset bits 7-0). A10 loads the low
+	// byte; A11 loads the high byte and starts the tone.
 	(void)data;
 	(void)mem_mask;
+	uint8_t const byte = uint8_t(offset & 0xff);
+	if (BIT(offset, 9))
+		m_dialer_word = uint16_t((m_dialer_word & 0xff00) | byte);
+	else if (BIT(offset, 10))
+	{
+		m_dialer_word = uint16_t((m_dialer_word & 0x00ff) | (uint16_t(byte) << 8));
+		bool const on = unixpc::dialer_speaker_on(m_dialer_word);
+		uint8_t const tone = uint8_t(m_dialer_word & unixpc::DIALER_TONE_MASK);
+		m_beep_lo->set_clock(uint32_t(unixpc::dtmf_row_hz(tone)));
+		m_beep_hi->set_clock(uint32_t(unixpc::dtmf_col_hz(tone)));
+		m_beep_lo->set_state(on ? 1 : 0);
+		m_beep_hi->set_state(on ? 1 : 0);
+	}
 }
 
 void unixpc_state::tcr_w(offs_t offset, uint16_t data)
@@ -960,9 +1010,12 @@ void unixpc_state::tcr_w(offs_t offset, uint16_t data)
 uint16_t unixpc_state::tsr_r()
 {
 	// b3..b0 active-low: msg waiting, ring2, ring1, offhook. Idle = all 1s.
+	// b4 is the P5.1 PAL feedback (MCR2 D4, sticky until RESET).
+	// Phone bits on D0-D7; duplicate D4 into D12 so an even-byte
+	// MOVE.B of $450000 still sees the PAL (D8-D15).
 	uint16_t data = 0x000f;
-	if (m_mcr2_mirror)
-		data |= 0x0010;
+	if (m_mcr2_p51)
+		data |= 0x1010;
 	return data;
 }
 
@@ -1021,7 +1074,7 @@ void unixpc_state::diskdma_size_w(offs_t offset, uint16_t data, uint16_t mem_mas
 	m_dma.set_count(uint16_t(value & 0x3fff));
 	m_dma.set_enabled(BIT(value, 15));
 	m_dma.set_reading(BIT(value, 14));
-	UNIXPC_LOG("dma count=%04x en=%d rd=%d ptr=%06x src=%d\n",
+	LOG("dma count=%04x en=%d rd=%d ptr=%06x src=%d\n",
 		m_dma.count(), int(m_dma.enabled()), int(m_dma.reading()), m_dma.pointer(), int(m_dma.source()));
 	if (m_dma.wants_transfer())
 		dma_service_floppy();
@@ -1044,7 +1097,7 @@ void unixpc_state::diskdma_ptr_w(offs_t offset, uint16_t data)
 
 void unixpc_state::disk_control_w(uint8_t data)
 {
-	UNIXPC_LOG("disk_control %02x\n", data);
+	LOG("disk_control %02x\n", data);
 	m_hdc_head_low = uint8_t(data & 7);
 	hdc_apply_head();
 
@@ -1085,7 +1138,7 @@ void unixpc_state::disk_control_w(uint8_t data)
 void unixpc_state::wd2797_intrq_w(int state)
 {
 	if (state != m_fdc_intrq)
-		UNIXPC_LOG("fdc irq %d\n", state);
+		LOG("fdc irq %d\n", state);
 	m_fdc_intrq = state != 0;
 	if (m_fdc_intrq)
 		m_fdc_irq_latch = true;
@@ -1143,7 +1196,7 @@ void unixpc_state::fdc16_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 void unixpc_state::wd2797_drq_w(int state)
 {
 	if ((state != 0) != m_fdc_drq)
-		UNIXPC_LOG("fdc drq %d\n", state);
+		LOG("fdc drq %d\n", state);
 	m_fdc_drq = state != 0;
 	if (m_fdc_drq)
 		dma_service_floppy();
@@ -1202,7 +1255,7 @@ void unixpc_state::hdc_reg_w(offs_t offset, uint8_t data)
 	{
 		unsigned const head = unsigned(m_hdc_head_low & 7) | (m_hdc_head4 ? 8u : 0u);
 		uint8_t const sec = uint8_t(m_hdc_sector & 0x1f);
-		UNIXPC_LOG("hdc cmd %02x pc=%06x chs=%u:%u:%u nsec=%u lba=%u ptr=%06x cnt=%04x\n",
+		LOG("hdc cmd %02x pc=%06x chs=%u:%u:%u nsec=%u lba=%u ptr=%06x cnt=%04x\n",
 			data, unsigned(m_maincpu->pc()), unsigned(m_hdc_cyl), head, unsigned(sec),
 			unsigned(m_hdc_seccnt), unixpc::winchester_lba(m_hdc_cyl, head, sec),
 			m_dma.pointer(), m_dma.count());
@@ -1274,7 +1327,7 @@ void unixpc_state::hdc_bdrq_w(int state)
 	if (lba == ~uint32_t(0))
 		lba = unixpc::winchester_lba(m_hdc_cyl, head, sec);
 
-	UNIXPC_LOG("hdc bdrq lba=%u chs=%u:%u:%u dma=%04x rd=%d\n",
+	LOG("hdc bdrq lba=%u chs=%u:%u:%u dma=%04x rd=%d\n",
 		lba, unsigned(m_hdc_cyl), unsigned(head), unsigned(sec),
 		m_dma.count(), int(m_dma.reading()));
 
@@ -1383,12 +1436,9 @@ void unixpc_state::kbd_scan()
 		if (m_kbd.empty() && m_kbd_bits == 0
 			&& (m_mouse_pdx != 0 || m_mouse_pdy != 0 || mb != m_mouse_sent_b))
 		{
-			int sdx = m_mouse_pdx;
-			int sdy = m_mouse_pdy;
-			if (sdx > 127) sdx = 127;
-			if (sdx < -127) sdx = -127;
-			if (sdy > 127) sdy = 127;
-			if (sdy < -127) sdy = -127;
+			int const acc = int(m_mouse_acc->read());
+			int const sdx = unixpc::kbd_queue::scale_delta(m_mouse_pdx, acc);
+			int const sdy = unixpc::kbd_queue::scale_delta(m_mouse_pdy, acc);
 			uint8_t pkt[5];
 			int const n = unixpc::kbd_queue::fill_mouse(sdx, sdy, mb, pkt);
 			for (int i = 0; i < n; i++)
@@ -1442,14 +1492,9 @@ TIMER_CALLBACK_MEMBER(unixpc_state::kbd_clock)
 
 uint32_t unixpc_state::screen_update(screen_device &screen, bitmap_ind16 &bitmap, const rectangle &cliprect)
 {
-	int const ph = int(m_phosphor->read() & 3);
-	rgb_t fg = rgb_t(0xff, 0xff, 0xff);
-	if (ph == 1)
-		fg = rgb_t(0x33, 0xff, 0x66);
-	else if (ph == 2)
-		fg = rgb_t(0xff, 0xb4, 0x3c);
+	unixpc::rgb8 const ink = unixpc::phosphor_ink(int(m_phosphor->read()));
 	m_palette->set_pen_color(0, rgb_t(0, 0, 0));
-	m_palette->set_pen_color(1, fg);
+	m_palette->set_pen_color(1, rgb_t(ink.r, ink.g, ink.b));
 
 	int const y0 = cliprect.min_y;
 	int const y1 = cliprect.max_y;
@@ -1457,7 +1502,7 @@ uint32_t unixpc_state::screen_update(screen_device &screen, bitmap_ind16 &bitmap
 	int const x1 = cliprect.max_x;
 	for (int y = y0; y <= y1; y++)
 	{
-		int const row = y * (720 / 16);
+		int const row = y * unixpc::SCREEN_ROW_WORDS;
 		for (int x = x0; x <= x1; x++)
 			bitmap.pix(y, x) = BIT(m_videoram[row + (x >> 4)], x & 15);
 	}
@@ -1499,7 +1544,9 @@ void unixpc_state::unixpc_mem(address_map &map)
 	map(0x800000, 0x803fff).rom().region("bootrom", 0);
 	map(0xe00000, 0xe0000f).mirror(0x0fff0).rw(FUNC(unixpc_state::hdc_word_r), FUNC(unixpc_state::hdc_word_w));
 	map(0xe10000, 0xe10007).mirror(0x0fff8).rw(FUNC(unixpc_state::fdc16_r), FUNC(unixpc_state::fdc16_w));
-	map(0xe20000, 0xe20001).w(FUNC(unixpc_state::mcr2_w));
+	// Whole 64K block, and the $F2xxxx alias. Byte or word writes.
+	map(0xe20000, 0xe20001).mirror(0x00fffe).w(FUNC(unixpc_state::mcr2_w));
+	map(0xf20000, 0xf20001).mirror(0x00fffe).w(FUNC(unixpc_state::mcr2_w));
 	map(0xe30000, 0xe30001).r(FUNC(unixpc_state::rtc_r));
 	map(0xe40000, 0xe40001).select(0x7000).w(FUNC(unixpc_state::gcr_w));
 	map(0xe50000, 0xe50007).rw("mpsc", FUNC(upd7201_device::cd_ba_r), FUNC(upd7201_device::cd_ba_w)).umask16(0x00ff);
@@ -1597,6 +1644,14 @@ static INPUT_PORTS_START( unixpc )
 	PORT_CONFSETTING(0x00, "White")
 	PORT_CONFSETTING(0x01, "Green")
 	PORT_CONFSETTING(0x02, "Amber")
+	PORT_START("WINSCALE")
+	PORT_CONFNAME(0x03, 0x01, "Window scale")
+	PORT_CONFSETTING(0x00, "1.5x")
+	PORT_CONFSETTING(0x01, "2x")
+	PORT_CONFSETTING(0x02, "2.5x")
+	PORT_CONFSETTING(0x03, "3x")
+	PORT_START("MOUSEACC")
+	PORT_ADJUSTER(100, "Mouse acceleration") PORT_MINMAX(50, 300)
 
 	PORT_START("MOUSEX")
 	PORT_BIT(0xffff, 0x0000, IPT_MOUSE_X) PORT_SENSITIVITY(40) PORT_KEYDELTA(0)
@@ -1646,7 +1701,7 @@ void unixpc_state::unixpc(machine_config &config)
 	mreg.bit_handler<6>().set([this](int state) { m_dma.set_reading(state != 0); });
 	// D15: CLRSINT-. High releases the 60 Hz latch; low holds it clear.
 	mreg.bit_handler<7>().set([this](int state) {
-		UNIXPC_LOG("clrsint_high %d\n", state);
+		LOG("clrsint_high %d\n", state);
 		m_board.set_clrsint_high(state != 0);
 		if (!state)
 			m_maincpu->set_input_line(M68K_IRQ_6, CLEAR_LINE);
@@ -1655,7 +1710,8 @@ void unixpc_state::unixpc(machine_config &config)
 	// video hardware
 	screen_device &screen(SCREEN(config, "screen"));
 	screen.set_screen_update(FUNC(unixpc_state::screen_update));
-	screen.set_raw(40_MHz_XTAL / 2, 896, 0, 720, 367, 0, 348);
+	screen.set_raw(40_MHz_XTAL / 2, 896, 0, unixpc::SCREEN_W, 367, 0, unixpc::SCREEN_H);
+	screen.set_physical_aspect(unixpc::SCREEN_W, unixpc::SCREEN_H);
 	screen.set_palette("palette");
 	screen.screen_vblank().set(FUNC(unixpc_state::vblank_w));
 	// vsync should actually last 17264 pixels
@@ -1663,6 +1719,10 @@ void unixpc_state::unixpc(machine_config &config)
 	config.set_default_layout(layout_unixpc);
 
 	PALETTE(config, "palette", palette_device::MONOCHROME);
+
+	SPEAKER(config, "mono").front_center();
+	BEEP(config, m_beep_lo, 697).add_route(ALL_OUTPUTS, "mono", 0.20);
+	BEEP(config, m_beep_hi, 1209).add_route(ALL_OUTPUTS, "mono", 0.20);
 
 	// internal ram
 	RAM(config, RAM_TAG).set_default_size("4M").set_extra_options("512K,1M,2M,4M");
@@ -1723,4 +1783,4 @@ ROM_END
 ***************************************************************************/
 
 //    YEAR  NAME  PARENT  COMPAT  MACHINE  INPUT   CLASS         INIT        COMPANY  FULLNAME             FLAGS
-COMP( 1985, 3b1,  0,      0,      unixpc,  unixpc, unixpc_state, empty_init, "AT&T",  "UNIX PC Model 3B1", MACHINE_NOT_WORKING | MACHINE_NO_SOUND )
+COMP( 1985, 3b1,  0,      0,      unixpc,  unixpc, unixpc_state, empty_init, "AT&T",  "UNIX PC Model 3B1", MACHINE_NOT_WORKING )

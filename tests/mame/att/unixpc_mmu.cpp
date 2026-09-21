@@ -21,6 +21,8 @@
 #include "unixpc_rtc.h"
 #include "unixpc_hdc.h"
 #include "unixpc_kbd.h"
+#include "unixpc_sound.h"
+#include "unixpc_video.h"
 
 #include <array>
 #include <cstdint>
@@ -324,4 +326,24 @@ TEST_CASE("unixpc mouse packet CE flags dx dy", "[unixpc]")
 	REQUIRE(n == 5);
 	REQUIRE(p[3] == 0xdf);
 	REQUIRE(p[4] == 0xdf);
+	REQUIRE(unixpc::kbd_queue::clamp_delta(200) == 127);
+	REQUIRE(unixpc::kbd_queue::clamp_delta(-200) == -127);
+	REQUIRE(unixpc::kbd_queue::clamp_delta(3) == 3);
+	REQUIRE(unixpc::kbd_queue::scale_delta(10, 100) == 10);
+	REQUIRE(unixpc::kbd_queue::scale_delta(10, 50) == 5);
+	REQUIRE(unixpc::kbd_queue::scale_delta(10, 300) == 30);
+	REQUIRE(unixpc::kbd_queue::scale_delta(100, 300) == 127);
+}
+
+TEST_CASE("unixpc phosphor and 838A DTMF", "[unixpc]")
+{
+	REQUIRE(unixpc::SCREEN_W == 720);
+	REQUIRE(unixpc::SCREEN_H == 348);
+	REQUIRE(unixpc::phosphor_ink(0).r == 0xff);
+	REQUIRE(unixpc::phosphor_ink(1).g == 0xff);
+	REQUIRE(unixpc::phosphor_ink(2).r == 0xff);
+	REQUIRE(unixpc::dtmf_row_hz(0x90) == 697);
+	REQUIRE(unixpc::dtmf_col_hz(0x90) == 1209);
+	REQUIRE(unixpc::dialer_speaker_on(0x0a90));
+	REQUIRE_FALSE(unixpc::dialer_speaker_on(0));
 }
