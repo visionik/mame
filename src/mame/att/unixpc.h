@@ -108,6 +108,7 @@ public:
 		m_winscale(*this, "WINSCALE"),
 		m_diskcfg(*this, "DISKCFG"),
 		m_paritycfg(*this, "PARITY"),
+		m_modemcfg(*this, "MODEM"),
 		m_palette(*this, "palette"),
 		m_beep_lo(*this, "beep_lo"),
 		m_beep_hi(*this, "beep_hi"),
@@ -190,6 +191,8 @@ private:
 	uint16_t hdc_word_r(offs_t offset, uint16_t mem_mask = ~0);
 	uint16_t modem_r(offs_t offset);
 	void modem_w(offs_t offset, uint16_t data, uint16_t mem_mask = ~0);
+	void modem_reset_regs();
+	void modem_update_rr2();
 	void dialer_w(offs_t offset, uint16_t data, uint16_t mem_mask = ~0);
 	uint8_t mpsc_cd_r(offs_t offset);
 	void mpsc_cd_w(offs_t offset, uint8_t data);
@@ -262,6 +265,7 @@ private:
 	required_ioport m_winscale;
 	required_ioport m_diskcfg;
 	required_ioport m_paritycfg;
+	required_ioport m_modemcfg;
 	unixpc::disk_combo m_combo = unixpc::DISK;
 	required_device<palette_device> m_palette;
 	required_device<beep_device> m_beep_lo;
@@ -291,6 +295,12 @@ private:
 	std::unordered_set<uint32_t> m_poison;
 	// Sorted snapshot of m_poison for save states (unordered_set is not saveable).
 	std::vector<uint32_t> m_poison_save;
+
+	// On-board 882A modem stub. Off → RR2 reads 0xFF (absent). On →
+	// presence + idle status so Contiki can open /dev/ph0. No phone line.
+	bool m_modem_emul = false;
+	uint8_t m_modem_reg[unixpc::MODEM_REGS]{};
+	uint8_t m_modem_rr2 = unixpc::MODEM_ABSENT;
 
 	emu_timer *m_dma_timer = nullptr;
 	emu_timer *m_kbd_timer = nullptr;

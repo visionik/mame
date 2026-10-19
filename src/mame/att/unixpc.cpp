@@ -131,6 +131,9 @@ void unixpc_state::machine_start()
 	save_item(NAME(m_kbd_rxd));
 	save_item(NAME(m_parity_emul));
 	save_item(NAME(m_bpplus));
+	save_item(NAME(m_modem_emul));
+	save_item(NAME(m_modem_reg));
+	save_item(NAME(m_modem_rr2));
 	save_item(NAME(m_combo.board));
 	save_item(NAME(m_combo.chip));
 	save_item(NAME(m_poison_save));
@@ -187,6 +190,22 @@ void unixpc_state::state_postload()
 	m_kbc->write_rxd(1);
 	update_mpsc_irq();
 	m_maincpu->set_input_line(M68K_IRQ_6, m_board.timer_latched() ? ASSERT_LINE : CLEAR_LINE);
+	// Host -modem / Machine Config wins over the value baked into an older
+	// save (noloop was taken with the stub off). Re-resolve, then bring
+	// RR2 to idle-present if we just enabled the stub.
+	{
+		bool want = m_modem_emul;
+		auto const entry = machine().options().get_entry(OPTION_UNIXPC_MODEM);
+		if (entry != nullptr && entry->priority() > OPTION_PRIORITY_DEFAULT)
+			want = entry->bool_value();
+		else
+			want = BIT(m_modemcfg->read(), 0);
+		if (want != m_modem_emul || (want && m_modem_rr2 == uint8_t(unixpc::MODEM_ABSENT)))
+		{
+			m_modem_emul = want;
+			modem_reset_regs();
+		}
+	}
 }
 
 
@@ -207,6 +226,16 @@ void unixpc_state::machine_reset()
 	m_poison.clear();
 	m_poison_save.clear();
 	osd_printf_info("unixpc: RAM parity emulation %s\n", m_parity_emul ? "ON" : "OFF");
+	// -modem / -nomodem (or ini) override Machine Configuration when set.
+	{
+		auto const entry = machine().options().get_entry(OPTION_UNIXPC_MODEM);
+		if (entry != nullptr && entry->priority() > OPTION_PRIORITY_DEFAULT)
+			m_modem_emul = entry->bool_value();
+		else
+			m_modem_emul = BIT(m_modemcfg->read(), 0);
+	}
+	modem_reset_regs();
+	osd_printf_info("unixpc: on-board modem stub %s\n", m_modem_emul ? "ON" : "OFF");
 	// UNIX 3.51 maps years 00-86 into 2000-2086. Keep the live clock but
 	// pin the year at 87 so the kernel stays in the 20th century.
 	{
@@ -498,6 +527,13 @@ static INPUT_PORTS_START( unixpc )
 	// (BPPLUS poison writes + PIE read → level-7). Takes effect on reset.
 	PORT_START("PARITY")
 	PORT_CONFNAME(0x01, 0x00, "RAM parity emulation")
+	PORT_CONFSETTING(0x00, DEF_STR(Off))
+	PORT_CONFSETTING(0x01, DEF_STR(On))
+	// Off by default: RR2 = 0xFF (no modem), matching FreeBee. Turn on so
+	// Contiki can open /dev/ph0 without the "can not be opened" dialog.
+	// No phone line — dial/answer still fail. Takes effect on reset.
+	PORT_START("MODEM")
+	PORT_CONFNAME(0x01, 0x00, "On-board modem stub")
 	PORT_CONFSETTING(0x00, DEF_STR(Off))
 	PORT_CONFSETTING(0x01, DEF_STR(On))
 	PORT_START("MOUSEACC")

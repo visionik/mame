@@ -62,8 +62,43 @@ inline constexpr uint32_t MPSC_BASE       = 0xe50000;
 inline constexpr uint32_t MPSC_REGS       = 8;
 inline constexpr uint32_t MODEM_BASE      = 0xe60000;
 inline constexpr uint32_t MODEM_SIZE      = 0x10000;
-inline constexpr uint32_t MODEM_RR2       = 0x2000;
+// 882A register select is A15..A12 of the byte address (FreeBee modem.h).
+inline constexpr uint32_t MODEM_REG_SHIFT = 12;
+inline constexpr uint32_t MODEM_REG_MASK  = 0xf;
+inline constexpr unsigned MODEM_REGS      = 16;
+inline constexpr uint32_t MODEM_WR0       = 0x0; // line control
+inline constexpr uint32_t MODEM_WR1       = 0x1; // loopback / baud / voice
+inline constexpr uint32_t MODEM_RR2       = 0x2; // status to terminal (+0x2000)
+inline constexpr uint32_t MODEM_RR3       = 0x3; // status to lamps/relays
+inline constexpr uint32_t MODEM_WR4       = 0x4;
+inline constexpr uint32_t MODEM_WR5       = 0x5;
+inline constexpr uint32_t MODEM_WR6       = 0x6;
+inline constexpr uint32_t MODEM_WR8       = 0x8;
+inline constexpr uint32_t MODEM_WR9       = 0x9;
+inline constexpr uint32_t MODEM_RR10      = 0xa; // transceiver status
 inline constexpr uint16_t MODEM_ABSENT    = 0x00ff;
+// RR2 when the stub is present and idle (on-hook). FreeBee modem.h:
+// 0x80 self-test fail, 0x40 test mode, 0x20 data mode, 0x10 DSR,
+// 0x04 1200 baud, 0x02 data valid, 0x01 CTS. 0xFF means no modem.
+inline constexpr uint8_t MODEM_RR2_CTS    = 0x01;
+inline constexpr uint8_t MODEM_RR2_DVALID = 0x02;
+inline constexpr uint8_t MODEM_RR2_1200   = 0x04;
+inline constexpr uint8_t MODEM_RR2_DSR    = 0x10;
+inline constexpr uint8_t MODEM_RR2_DATA   = 0x20;
+inline constexpr uint8_t MODEM_RR2_TEST   = 0x40;
+inline constexpr uint8_t MODEM_RR2_FAIL   = 0x80;
+inline constexpr uint8_t MODEM_RR2_IDLE   =
+	MODEM_RR2_CTS | MODEM_RR2_DSR | MODEM_RR2_1200; // 0x15
+// WR0 line-control bits (low byte of the written word).
+inline constexpr uint8_t MODEM_WR0_RESET  = 0x01;
+inline constexpr uint8_t MODEM_WR0_DTR    = 0x04;
+inline constexpr uint8_t MODEM_WR0_DATA   = 0x10;
+inline constexpr uint8_t MODEM_WR0_OFFHOOK = 0x20;
+inline constexpr uint8_t MODEM_WR0_TALK   = 0x40;
+// WR1.
+inline constexpr uint8_t MODEM_WR1_1200   = 0x10;
+inline constexpr uint8_t MODEM_WR1_VOICE  = 0x20;
+inline constexpr uint8_t MODEM_WR1_EXTCLK = 0x40;
 inline constexpr uint16_t IO_OPEN         = 0xffff;
 inline constexpr uint32_t KBC_BASE        = 0xe70000;
 inline constexpr uint32_t KBC_REGS        = 4;

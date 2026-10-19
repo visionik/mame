@@ -329,23 +329,101 @@ void unixpc_state::exp_io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 		card->exp_w(byte % unixpc::EXP_IO_SIZE, data, mem_mask);
 }
 
+void unixpc_state::modem_reset_regs()
+{
+	for (auto &r : m_modem_reg)
+		r = 0;
+	m_modem_reg[unixpc::MODEM_WR1] = unixpc::MODEM_WR1_1200;
+	if (m_modem_emul)
+	{
+		m_modem_rr2 = unixpc::MODEM_RR2_IDLE;
+		m_modem_reg[unixpc::MODEM_RR2] = m_modem_rr2;
+	}
+	else
+	{
+		m_modem_rr2 = uint8_t(unixpc::MODEM_ABSENT);
+		m_modem_reg[unixpc::MODEM_RR2] = m_modem_rr2;
+	}
+}
+
+
+void unixpc_state::modem_update_rr2()
+{
+	if (!m_modem_emul)
+	{
+		m_modem_rr2 = uint8_t(unixpc::MODEM_ABSENT);
+		m_modem_reg[unixpc::MODEM_RR2] = m_modem_rr2;
+		return;
+	}
+
+	uint8_t rr2 = unixpc::MODEM_RR2_CTS | unixpc::MODEM_RR2_DSR;
+	uint8_t const wr0 = m_modem_reg[unixpc::MODEM_WR0];
+	uint8_t const wr1 = m_modem_reg[unixpc::MODEM_WR1];
+
+	if (wr1 & unixpc::MODEM_WR1_1200)
+		rr2 |= unixpc::MODEM_RR2_1200;
+	// Data mode / answered call — reflect WR0; no phone line so we never
+	// assert data-valid on our own.
+	if (wr0 & unixpc::MODEM_WR0_DATA)
+		rr2 |= unixpc::MODEM_RR2_DATA;
+
+	m_modem_rr2 = rr2;
+	m_modem_reg[unixpc::MODEM_RR2] = rr2;
+}
+
+
 uint16_t unixpc_state::modem_r(offs_t offset)
 {
-	// 882A. RR2 at +0x2000: 0xFF means no modem. There is no phone-line
-	// path on this board; channel B only has its baud clock. Empty I/O
-	// is all-ones.
+	// 882A. Register select is A15..A12. RR2 == 0xFF means no modem.
 	uint32_t const a = uint32_t(offset) << 1;
-	if ((a & 0xf000) == unixpc::MODEM_RR2)
-		return unixpc::MODEM_ABSENT;
-	return unixpc::IO_OPEN;
+	unsigned const reg = (a >> unixpc::MODEM_REG_SHIFT) & unixpc::MODEM_REG_MASK;
+
+	if (!m_modem_emul)
+	{
+		if (reg == unixpc::MODEM_RR2)
+			return unixpc::MODEM_ABSENT;
+		return unixpc::IO_OPEN;
+	}
+
+	if (reg == unixpc::MODEM_RR2)
+		return m_modem_rr2;
+	if (reg == unixpc::MODEM_RR3 || reg == unixpc::MODEM_RR10)
+		return m_modem_reg[reg];
+	return m_modem_reg[reg];
 }
 
 
 void unixpc_state::modem_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 {
-	(void)offset;
-	(void)data;
-	(void)mem_mask;
+	if (!m_modem_emul)
+		return;
+
+	uint32_t const a = uint32_t(offset) << 1;
+	unsigned const reg = (a >> unixpc::MODEM_REG_SHIFT) & unixpc::MODEM_REG_MASK;
+	uint8_t const byte = uint8_t(data & mem_mask & 0xff);
+
+	switch (reg)
+	{
+	case unixpc::MODEM_WR0:
+		m_modem_reg[reg] = byte;
+		if (byte & unixpc::MODEM_WR0_RESET)
+			modem_reset_regs();
+		else
+			modem_update_rr2();
+		break;
+	case unixpc::MODEM_WR1:
+	case unixpc::MODEM_WR4:
+	case unixpc::MODEM_WR5:
+	case unixpc::MODEM_WR6:
+	case unixpc::MODEM_WR8:
+	case unixpc::MODEM_WR9:
+		m_modem_reg[reg] = byte;
+		modem_update_rr2();
+		break;
+	default:
+		// RR2/RR3/RR10 and unused selects are read-side; ignore writes.
+		break;
+	}
 }
 
 
@@ -2037,7 +2115,10 @@ uint16_t unixpc_state::line_printer_r()
 {
 	uint16_t data = 0;
 
-	data |= 1 << unixpc::LPSR_NO_DIALTONE;
+	// Bit 0 set = no dial tone. With the modem stub present, report tone
+	// so Telephone Manager does not complain about a dead line at open.
+	if (!m_modem_emul)
+		data |= 1 << unixpc::LPSR_NO_DIALTONE;
 	// Bit 1 clear means a parity error is latched (active until CSR).
 	if (!m_board.perr())
 		data |= 1 << unixpc::LPSR_NO_PERR;
