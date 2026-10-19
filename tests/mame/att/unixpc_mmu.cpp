@@ -21,6 +21,10 @@
 #include "unixpc_rtc.h"
 #include "unixpc_hdc.h"
 #include "unixpc_kbd.h"
+#include "unixpc_serial.h"
+#include "unixpc_slot.h"
+#include "unixpc_io.h"
+#include "unixpc_enet.h"
 #include "unixpc_sound.h"
 #include "unixpc_video.h"
 
@@ -120,6 +124,26 @@ TEST_CASE("unixpc mapper remaps physical page", "[unixpc]")
 	auto p = mmu.translate(0x00005abc, false, true, false);
 	REQUIRE(p.result == access::ok);
 	REQUIRE(p.physical == ((0x3aau << 12) | 0xabc));
+}
+
+TEST_CASE("unixpc mapper high memory privilege", "[unixpc]")
+{
+	std::array<uint16_t, mapper::PAGE_COUNT> ram{};
+	mapper mmu;
+	mmu.bind(ram.data());
+
+	// Supervisor / DMA may touch I/O space; user may not (GSR $410000).
+	REQUIRE(mmu.check(0x00410000, false, true, false).result == access::ok);
+	REQUIRE(mmu.check(0x00410000, false, false, true).result == access::ok);
+	REQUIRE(mmu.check(0x00410000, false, false, false).result == access::privileged);
+
+	// VIDPAL user VRAM window is allowed.
+	mmu.set_vidpal(true);
+	REQUIRE(mmu.check(0x00420000, false, false, false).result == access::ok);
+	REQUIRE(mmu.check(0x00427fff, true, false, false).result == access::ok);
+	REQUIRE(mmu.check(0x00428000, false, false, false).result == access::privileged);
+	mmu.set_vidpal(false);
+	REQUIRE(mmu.check(0x00420000, false, false, false).result == access::privileged);
 }
 
 TEST_CASE("unixpc cpu fault encoding", "[unixpc]")
@@ -240,25 +264,253 @@ TEST_CASE("unixpc dma 512-byte sector fills 14-bit up-counter", "[unixpc]")
 	REQUIRE_FALSE(dma.wants_transfer());
 }
 
-TEST_CASE("unixpc rtc ALE latches address, CE-only does not", "[unixpc]")
+TEST_CASE("unixpc rtc board packing and year-87 digits", "[unixpc]")
 {
-	unixpc::rtc clk;
-	clk.reset();
-	// Month ones = register 8. CE|ALE|0x0800 then CE-only read strobe.
-	clk.write_control(uint16_t(unixpc::rtc::CE | unixpc::rtc::ALE | 0x0800));
-	REQUIRE(clk.addr() == 0x08);
-	clk.write_control(unixpc::rtc::CE);
-	REQUIRE(clk.addr() == 0x08);
-	uint16_t const w = clk.read_word();
-	REQUIRE((w & 0x000f) == ((w >> 8) & 0x000f));
-	// Year tens = register 0xB → 8 (year 87).
-	clk.write_control(uint16_t(unixpc::rtc::CE | unixpc::rtc::ALE | 0x0b00));
-	clk.write_control(unixpc::rtc::CE);
-	REQUIRE(clk.addr() == 0x0b);
-	REQUIRE((clk.read_word() & 0x000f) == 0x0008);
-	clk.write_control(uint16_t(unixpc::rtc::CE | unixpc::rtc::ALE | 0x0a00));
-	clk.write_control(unixpc::rtc::CE);
-	REQUIRE((clk.read_word() & 0x000f) == 0x0007);
+	// Packed control word at $480000: D15=CE, D14=ALE, D13=WE, D11-D8=nibble.
+	REQUIRE(unixpc::RTC_CE == 0x8000);
+	REQUIRE(unixpc::RTC_ALE == 0x4000);
+	REQUIRE(unixpc::RTC_WE == 0x2000);
+	REQUIRE(unixpc::rtc_control_nibble(0x0800) == 0x08);
+	REQUIRE(unixpc::rtc_control_nibble(uint16_t(unixpc::RTC_CE | unixpc::RTC_ALE | 0x0b00)) == 0x0b);
+	// Read port mirrors the digit onto both nibbles of the data word.
+	uint16_t const w = unixpc::rtc_read_word(0x08);
+	REQUIRE((w & 0x000f) == 0x0008);
+	REQUIRE(((w >> 8) & 0x000f) == 0x0008);
+	// UNIX 3.51 year pin: 87 → ones=7 (reg 0xA), tens=8 (reg 0xB).
+	REQUIRE(unixpc::RTC_UNIX351_YEAR == 1987);
+	REQUIRE(unixpc::RTC_UNIX351_YEAR % 100 == 87);
+	REQUIRE(unixpc::RTC_UNIX351_YEAR % 10 == 7);
+	REQUIRE((unixpc::RTC_UNIX351_YEAR / 10) % 10 == 8);
+	REQUIRE(unixpc::RTC_REG_Y1 == 0x0a);
+	REQUIRE(unixpc::RTC_REG_Y10 == 0x0b);
+	REQUIRE(unixpc::RTC_REG_TOUT == 0x0d);
+	REQUIRE(unixpc::RTC_REG_PROTECT == 0x0e);
+	REQUIRE(unixpc::RTC_REG_STATUS == 0x0f);
+}
+
+TEST_CASE("expansion slot identity and RAM windows", "[unixpc]")
+{
+	REQUIRE(unixpc::exp_window_base(0) == 0x00c00000u);
+	REQUIRE(unixpc::exp_window_base(1) == 0x00c40000u);
+	REQUIRE(unixpc::exp_window_base(7) == 0x00dc0000u);
+	REQUIRE(unixpc::exp_window_base(7) + unixpc::EXP_IO_SIZE == 0x00e00000u);
+
+	REQUIRE(unixpc::exp_id_address(unixpc::EXP_ID_LO));
+	REQUIRE(unixpc::exp_id_address(unixpc::EXP_ID_HI));
+	REQUIRE(unixpc::exp_id_address(unixpc::EXP_ID_LO_COMP));
+	REQUIRE(unixpc::exp_id_address(unixpc::EXP_ID_HI_COMP));
+	REQUIRE_FALSE(unixpc::exp_id_address(unixpc::EXP_ID_LO - 1));
+	REQUIRE_FALSE(unixpc::exp_id_address(0));
+
+	REQUIRE(unixpc::exp_id_complements_ok(0x10, 0x01, 0xf0, 0xff));
+	REQUIRE_FALSE(unixpc::exp_id_complements_ok(0xff, 0xff, 0xff, 0xff));
+	REQUIRE_FALSE(unixpc::exp_id_complements_ok(0x10, 0x01, 0xf0, 0x00));
+	REQUIRE(unixpc::exp_id_match(0x0110, 0x10, 0x01, 0xf0, 0xff));
+	REQUIRE_FALSE(unixpc::exp_id_match(0x0110, 0x10, 0x02, 0xf0, 0xfe));
+	REQUIRE_FALSE(unixpc::exp_id_match(0x0110, 0x11, 0x01, 0xef, 0xff));
+	REQUIRE_FALSE(unixpc::exp_id_match(0x0110, 0x10, 0x01, 0x00, 0xff));
+
+	uint8_t lo[3] = { 0xff, 0x10, 0x20 };
+	uint8_t hi[3] = { 0xff, 0x01, 0x00 };
+	uint8_t clo[3] = { 0xff, 0xf0, 0xe0 };
+	uint8_t chi[3] = { 0xff, 0xff, 0x00 };
+	REQUIRE(unixpc::exp_id_find(0x0110, lo, hi, clo, chi, 3) == 1);
+	REQUIRE(unixpc::exp_id_find(0x0020, lo, hi, clo, chi, 3) == 2);
+	REQUIRE(unixpc::exp_id_find(0xffff, lo, hi, clo, chi, 3) == -1);
+	REQUIRE(unixpc::exp_id_find(0x0110, lo, hi, clo, chi, 0) == -1);
+
+	uint32_t start = 0;
+	uint32_t end = 0;
+	REQUIRE(unixpc::exp_ram_512(0, start, end));
+	REQUIRE(start == 0x00200000u);
+	REQUIRE(end == 0x00280000u);
+	REQUIRE(unixpc::exp_ram_512(3, start, end));
+	REQUIRE(start == 0x00380000u);
+	REQUIRE(end == 0x00400000u);
+	REQUIRE_FALSE(unixpc::exp_ram_512(4, start, end));
+	REQUIRE_FALSE(unixpc::exp_ram_512(-1, start, end));
+
+	REQUIRE(unixpc::exp_ram_1m(1, start, end));
+	REQUIRE(start == 0x00200000u);
+	REQUIRE(end == 0x00300000u);
+	REQUIRE(unixpc::exp_ram_1m(2, start, end));
+	REQUIRE(start == 0x00300000u);
+	REQUIRE(end == 0x00400000u);
+	REQUIRE(unixpc::exp_ram_1m_conflict(0, 1));
+	REQUIRE_FALSE(unixpc::exp_ram_1m_conflict(1, 2));
+	REQUIRE_FALSE(unixpc::exp_ram_1m_conflict(0, 9));
+
+	unixpc::exp_ram_1_5(start, end);
+	REQUIRE(start == 0x00200000u);
+	REQUIRE(end == 0x00380000u);
+	unixpc::exp_ram_2m(start, end);
+	REQUIRE(start == 0x00200000u);
+	REQUIRE(end == 0x00400000u);
+
+	REQUIRE(unixpc::exp_reset_write(0x0003fff8u));
+	REQUIRE(unixpc::exp_reset_write(0x0003ffffu));
+	REQUIRE(unixpc::exp_reset_write(0x0003fffb));
+	REQUIRE_FALSE(unixpc::exp_reset_write(0x0003fff0u));
+	REQUIRE_FALSE(unixpc::exp_reset_write(0));
+
+	uint32_t volatile full_bytes = 0x00400000u;
+	unixpc::ram_sizes const full = unixpc::ram_installed(full_bytes);
+	REQUIRE(full.board == 0x00200000u);
+	REQUIRE(full.expansion == 0x00200000u);
+	uint32_t volatile board_bytes = 0x00100000u;
+	unixpc::ram_sizes const board_only = unixpc::ram_installed(board_bytes);
+	REQUIRE(board_only.board == 0x00100000u);
+	REQUIRE(board_only.expansion == 0u);
+	uint32_t volatile huge_bytes = 0x00800000u;
+	unixpc::ram_sizes const clamped = unixpc::ram_installed(huge_bytes);
+	REQUIRE(clamped.board == 0x00200000u);
+	REQUIRE(clamped.expansion == 0x00200000u);
+
+	// 2 MiB on the board plus 2 MiB on the card is the same as a flat 4 MiB.
+	for (uint32_t addr = 0; addr < 0x00400000u; addr += 0x10000u)
+	{
+		unixpc::ram_ref const rd = unixpc::ram_access(addr, full.board, full.expansion, false);
+		unixpc::ram_ref const wr = unixpc::ram_access(addr, full.board, full.expansion, true);
+		REQUIRE(rd.hit);
+		REQUIRE(wr.hit);
+		REQUIRE(rd.storage == addr);
+		REQUIRE(wr.storage == addr);
+	}
+	REQUIRE_FALSE(unixpc::ram_access(0x00400000u, full.board, full.expansion, false).hit);
+
+	// A 1 MiB board wraps reads inside that megabyte and drops writes past it.
+	unixpc::ram_ref const wrapped = unixpc::ram_access(0x00180000u, 0x00100000u, 0, false);
+	REQUIRE(wrapped.hit);
+	REQUIRE(wrapped.storage == 0x00080000u);
+	REQUIRE_FALSE(unixpc::ram_access(0x00180000u, 0x00100000u, 0, true).hit);
+	REQUIRE_FALSE(unixpc::ram_access(0x00200000u, 0x00100000u, 0, false).hit);
+	REQUIRE_FALSE(unixpc::ram_access(0, 0, 0, false).hit);
+	uint32_t volatile oversize_board = 0x00300000u;
+	REQUIRE_FALSE(unixpc::ram_access(0, oversize_board, 0, false).hit);
+
+	unixpc::ram_ref const bank = unixpc::ram_access(0x00201000u, 0x00200000u, 0x00080000u, true);
+	REQUIRE(bank.hit);
+	REQUIRE(bank.storage == 0x00201000u);
+	REQUIRE_FALSE(unixpc::ram_access(0x00280000u, 0x00200000u, 0x00080000u, false).hit);
+	unixpc::ram_ref const combo = unixpc::ram_access(0x0037fffeu, 0x00200000u, 0x00180000u, false);
+	REQUIRE(combo.hit);
+	REQUIRE_FALSE(unixpc::ram_access(0x00380000u, 0x00200000u, 0x00180000u, false).hit);
+}
+
+TEST_CASE("ethernet window registers", "[unixpc]")
+{
+	REQUIRE(unixpc::enet_mac_octet(unixpc::ENET_MAC0) == 0);
+	REQUIRE(unixpc::enet_mac_octet(unixpc::ENET_MAC_LSB) == 5);
+	REQUIRE(unixpc::enet_mac_octet(unixpc::ENET_MAC0 - 1) == -1);
+	REQUIRE(unixpc::enet_mac_octet(unixpc::ENET_MAC_LSB - 2) == -1);
+	REQUIRE(unixpc::enet_mac_octet(0) == -1);
+	REQUIRE(unixpc::enet_ring_address(0x1234) == (0x1234u << unixpc::ENET_RING_SHIFT));
+	REQUIRE(unixpc::ENET_CTL_BOOT == (unixpc::ENET_DMAEN | unixpc::ENET_INT1));
+	REQUIRE(unixpc::exp_id_byte(unixpc::EIA_ID, unixpc::EXP_ID_LO) == 0x10);
+	REQUIRE(unixpc::exp_id_byte(unixpc::EIA_ID, unixpc::EXP_ID_HI) == 0x00);
+	REQUIRE(unixpc::exp_id_byte(unixpc::EIA_ID, unixpc::EXP_ID_LO_COMP) == 0xf0);
+	REQUIRE(unixpc::exp_id_byte(unixpc::EIA_ID, unixpc::EXP_ID_HI_COMP) == 0x00);
+	REQUIRE(unixpc::exp_id_byte(unixpc::ENET_ID, unixpc::EXP_ID_LO) == 0x03);
+	REQUIRE(unixpc::exp_id_byte(unixpc::ENET_ID, unixpc::EXP_ID_HI) == 0x10);
+	REQUIRE(unixpc::exp_id_byte(unixpc::ENET_ID, unixpc::EXP_ID_LO_COMP) == 0xfd);
+	REQUIRE(unixpc::exp_id_byte(unixpc::ENET_ID, unixpc::EXP_ID_HI_COMP) == 0xf0);
+	REQUIRE(unixpc::exp_id_byte(unixpc::ENET_ID, 0) == -1);
+	REQUIRE(unixpc::eia_decode(unixpc::EIA_B_CTRL) == unixpc::eia_reg::b_ctrl);
+	REQUIRE(unixpc::eia_decode(unixpc::EIA_A_CTRL) == unixpc::eia_reg::a_ctrl);
+	REQUIRE(unixpc::eia_decode(unixpc::EIA_B_DATA) == unixpc::eia_reg::b_data);
+	REQUIRE(unixpc::eia_decode(unixpc::EIA_A_DATA) == unixpc::eia_reg::a_data);
+	REQUIRE(unixpc::eia_decode(1) == unixpc::eia_reg::none);
+	REQUIRE(unixpc::EIA_IPL == 5);
+	REQUIRE(unixpc::cpu_autovector(unixpc::EIA_IPL) == 29);
+	REQUIRE(unixpc::cpu_autovector_offset(unixpc::EIA_IPL) == 0x74);
+	REQUIRE(unixpc::cpu_autovector(1) == 25);
+	REQUIRE(unixpc::cpu_autovector_offset(1) == 0x64);
+	REQUIRE(unixpc::exp_irq_bit(0) == 0);
+	REQUIRE(unixpc::exp_irq_bit(1) == 1);
+	REQUIRE(unixpc::exp_irq_bit(2) == 2);
+	REQUIRE(unixpc::exp_irq_bit(3) == -1);
+	REQUIRE(unixpc::exp_irq_bit(-1) == -1);
+	REQUIRE(unixpc::lpsr_printer_bits(true, true, true, true) == unixpc::LPSR_PRINTER_FLOAT);
+	REQUIRE(unixpc::lpsr_printer_bits(false, true, false, true) == ((1u << unixpc::LPSR_SELECT) | (1u << unixpc::LPSR_FAULT)));
+	REQUIRE(unixpc::lp_ack_leading(true, false));
+	REQUIRE_FALSE(unixpc::lp_ack_leading(false, false));
+	REQUIRE_FALSE(unixpc::lp_ack_leading(true, true));
+	REQUIRE(unixpc::lp_ack_trailing(false, true));
+	REQUIRE_FALSE(unixpc::lp_ack_trailing(true, true));
+	REQUIRE_FALSE(unixpc::lp_ack_trailing(true, false));
+	REQUIRE(unixpc::lp_visible_busy(false, true));
+	REQUIRE(unixpc::lp_visible_busy(true, false));
+	REQUIRE_FALSE(unixpc::lp_visible_busy(false, false));
+	REQUIRE(unixpc::LP_ACK_DELAY_USEC > 20);
+	REQUIRE(unixpc::LPSR_PRINTER_FLOAT == 0x00f0);
+	REQUIRE((unixpc::LPSR_PRINTER_FLOAT & (1u << unixpc::LPSR_BUSY)) != 0);
+	REQUIRE((unixpc::LPSR_PRINTER_FLOAT & (1u << unixpc::LPSR_HDC_IRQ)) == 0);
+
+	unixpc::enet_board board;
+	board.raise_irq();
+	REQUIRE(board.irq());
+	board.write_control(0x00ff);
+	REQUIRE(board.control() == unixpc::ENET_CTL_MASK);
+	REQUIRE(board.dma_enabled());
+	REQUIRE_FALSE(board.ethernet_selected());
+	REQUIRE(board.interrupt_level_1());
+	REQUIRE(board.read_control() == unixpc::ENET_CTL_MASK);
+	REQUIRE_FALSE(board.irq());
+
+	board.reset();
+	REQUIRE(board.control() == 0);
+	REQUIRE(board.ethernet_selected());
+	REQUIRE_FALSE(board.dma_enabled());
+	REQUIRE_FALSE(board.interrupt_level_1());
+	board.capture(0x1234);
+	REQUIRE(board.latch() == 0x1234);
+	board.raise_irq();
+	board.write_ring(0xabcd);
+	REQUIRE(board.ring() == 0xabcd);
+	REQUIRE_FALSE(board.irq());
+	REQUIRE(board.latch() == 0x1234);
+}
+
+TEST_CASE("disk combo in use is P5.1 plus WD2010", "[unixpc]")
+{
+	REQUIRE(unixpc::DISK.p51());
+	REQUIRE(unixpc::DISK.chip == unixpc::hdc_chip::wd2010);
+	REQUIRE(unixpc::DISK.heads() == 16u);
+	REQUIRE(unixpc::DISK.cylinders() == 1400u);
+	REQUIRE(unixpc::DISK.cyl_hi_mask() == 0x07);
+	REQUIRE(unixpc::WINCH_CYLS == 1400u);
+	REQUIRE(unixpc::WINCH_HEADS == 16u);
+
+	unixpc::disk_combo const p3_1010{ unixpc::board_rev::p3_p5, unixpc::hdc_chip::wd1010 };
+	unixpc::disk_combo const p3_2010{ unixpc::board_rev::p3_p5, unixpc::hdc_chip::wd2010 };
+	unixpc::disk_combo const p51_1010{ unixpc::board_rev::p51, unixpc::hdc_chip::wd1010 };
+	REQUIRE(p3_1010.heads() == 8u);
+	REQUIRE(p3_1010.cylinders() == 1024u);
+	REQUIRE(p3_1010.cyl_hi_mask() == 0x03);
+	REQUIRE(p3_2010.heads() == 8u);
+	REQUIRE(p3_2010.cylinders() == 1400u);
+	REQUIRE(p3_2010.cyl_hi_mask() == 0x07);
+	REQUIRE(p51_1010.heads() == 16u);
+	REQUIRE(p51_1010.cylinders() == 1024u);
+	REQUIRE(p51_1010.cyl_hi_mask() == 0x03);
+	REQUIRE(unixpc::winchester_lba(p3_1010, 0, 8, 0) == ~uint32_t(0));
+	REQUIRE(unixpc::winchester_lba(p3_1010, 1024, 0, 0) == ~uint32_t(0));
+	REQUIRE(unixpc::winchester_lba(p3_2010, 1024, 0, 0) == 1024u * 8u * 17u);
+	REQUIRE(unixpc::winchester_lba(p51_1010, 1023, 15, 16) != ~uint32_t(0));
+	REQUIRE(unixpc::winchester_lba(p51_1010, 1024, 0, 0) == ~uint32_t(0));
+	REQUIRE(unixpc::winchester_sectors(p3_1010) == 1024u * 8u * 17u);
+	REQUIRE(unixpc::winchester_lba_next(p3_1010, unixpc::winchester_sectors(p3_1010) - 1) == ~uint32_t(0));
+	REQUIRE(unixpc::winchester_lba_next(p3_1010, 0) == 1u);
+
+	REQUIRE(unixpc::winch_use_second(true, true));
+	REQUIRE_FALSE(unixpc::winch_use_second(false, true));
+	REQUIRE_FALSE(unixpc::winch_use_second(true, false));
+	REQUIRE(unixpc::winch_missing_second(true, false, 0x20));
+	REQUIRE_FALSE(unixpc::winch_missing_second(true, false, 0x10));
+	REQUIRE_FALSE(unixpc::winch_missing_second(true, true, 0x20));
+	REQUIRE_FALSE(unixpc::winch_missing_second(false, false, 0x20));
+	REQUIRE(unixpc::FDC_NOT_READY == 0x80);
+	REQUIRE(unixpc::SDH_DRIVE1 == 0x08);
 }
 
 TEST_CASE("unixpc winchester LBA is 1400/16/17 0-based", "[unixpc]")
@@ -346,4 +598,20 @@ TEST_CASE("unixpc phosphor and 838A DTMF", "[unixpc]")
 	REQUIRE(unixpc::dtmf_col_hz(0x90) == 1209);
 	REQUIRE(unixpc::dialer_speaker_on(0x0a90));
 	REQUIRE_FALSE(unixpc::dialer_speaker_on(0));
+}
+
+TEST_CASE("unixpc rs232 baud generator is 1.2288 MHz over 4N", "[unixpc]")
+{
+	REQUIRE(unixpc::dialer_is_baud(0));
+	REQUIRE(unixpc::dialer_is_baud(2));
+	REQUIRE_FALSE(unixpc::dialer_is_baud(1u << 9));
+	REQUIRE_FALSE(unixpc::dialer_is_baud(1u << 10));
+	REQUIRE(unixpc::dialer_baud_n(2) == 2);
+	REQUIRE(unixpc::dialer_baud_n(16) == 16);
+	REQUIRE(unixpc::rs232_clock_hz(0) == 0);
+	REQUIRE(unixpc::rs232_clock_hz(1) == 307200);
+	REQUIRE(unixpc::rs232_clock_hz(2) == 153600);
+	REQUIRE(unixpc::rs232_clock_hz(16) == 19200);
+	REQUIRE(unixpc::rs232_clock_hz(64) == 4800);
+	REQUIRE(unixpc::MODEM_UART_CLOCK == 19200);
 }

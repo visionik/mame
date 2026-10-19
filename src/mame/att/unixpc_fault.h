@@ -17,6 +17,8 @@
 // MCR bit 15 is CLRSINT- (active-low clear of the 60 Hz IRQ6 latch), not a
 // timer enable.
 
+class device_t;
+
 namespace unixpc {
 
 enum class fault_kind : uint8_t
@@ -127,6 +129,20 @@ inline status_regs encode_dma_fault(bool dma_from_memory, uint32_t addr, bool pi
 	return r;
 }
 
+// Forced bad-parity read (diag BPPLUS path). Same BSR shape as a CPU
+// data fault (odd-byte → 0x7Exx, even-byte → 0x7Dxx, word → 0x7Cxx);
+// GSR uses 0x05ff so it is distinct from page/priv encodings. Pass the
+// real byte address (low bit set on odd-byte cycles) — the Diagnostic
+// Disk checks BSR against the probe VA (e.g. $23001).
+inline status_regs encode_parity_fault(bool write, uint32_t addr, int width_bits, bool pie)
+{
+	status_regs r;
+	r.genstat = pie_bits(pie) | (write ? uint16_t(0) : uint16_t(0x4000)) | uint16_t(0x05ff);
+	r.bsr0 = cpu_bsr0(addr, width_bits, false);
+	r.bsr1 = uint16_t(addr);
+	return r;
+}
+
 class board_status
 {
 public:
@@ -139,12 +155,14 @@ public:
 		m_timer_latched = false;
 		m_clrsint_high = false; // MCR reads 0 after reset: CLRSINT- asserted
 		m_status_frozen = false;
+		m_perr = false;
 	}
 
 	void set_ee(bool v) { m_ee = v; }
 	void set_pie(bool v) { m_pie = v; }
 	bool ee() const { return m_ee; }
 	bool pie() const { return m_pie; }
+	bool perr() const { return m_perr; }
 
 	status_regs const &regs() const { return m_regs; }
 
@@ -171,12 +189,29 @@ public:
 		return true;
 	}
 
+	// Parity: freeze GSR/BSR and raise level-7.
+	// Gated by PIE at the caller (poisoned read), not by EE. The Diagnostic
+	// Disk enables PIE around the forced-bad-parity byte read and never
+	// touches EE in that routine; EE still gates MMU bus errors and DMA NMI.
+	bool latch_parity(status_regs const &r)
+	{
+		if (!m_status_frozen)
+			m_regs = r;
+		m_status_frozen = true;
+		m_perr = true;
+		if (m_nmi_latched)
+			return false;
+		m_nmi_latched = true;
+		return true;
+	}
+
 	void clear_status()
 	{
 		m_regs.bsr0 |= 0x8000;
 		m_regs.genstat |= 0x1100;
 		m_nmi_latched = false;
 		m_status_frozen = false;
+		m_perr = false;
 	}
 
 	bool nmi_latched() const { return m_nmi_latched; }
@@ -200,6 +235,8 @@ public:
 
 	bool timer_latched() const { return m_timer_latched; }
 
+	friend void unixpc_save_board(device_t &host, board_status &board);
+
 private:
 	status_regs m_regs{};
 	bool m_ee = false;
@@ -208,7 +245,10 @@ private:
 	bool m_timer_latched = false;
 	bool m_clrsint_high = false;
 	bool m_status_frozen = false;
+	bool m_perr = false;
 };
+
+void unixpc_save_board(device_t &host, board_status &board);
 
 } // namespace unixpc
 

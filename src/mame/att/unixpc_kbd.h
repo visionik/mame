@@ -16,7 +16,17 @@
 // transition. Mouse packets start with 0xce; the next keyboard report is
 // then prefixed with 0xdf. Scancodes come from the TRM keycap chart.
 
+class device_t;
+
 namespace unixpc {
+
+inline constexpr int KEY_BANKS = 4;
+inline constexpr int KBD_BAUD = 1200;
+inline constexpr int KBD_CLOCK_MUL = 16;
+inline constexpr int KBD_FRAME_BITS = 11;
+inline constexpr int KBD_CELL_MASK = 15;
+inline constexpr uint16_t KBD_STOP_BITS = 0x600;
+inline constexpr uint8_t MOUSE_BUTTON_MASK = 0x07;
 
 class kbd_queue
 {
@@ -64,6 +74,8 @@ public:
 	}
 
 	void mark_mouse() { m_last_was_mouse = true; }
+
+	friend void unixpc_save_kbd(device_t &host, kbd_queue &queue);
 
 	static constexpr uint8_t LIST_END = 0x80;
 
@@ -142,9 +154,11 @@ public:
 
 private:
 	std::array<uint8_t, SIZE> m_buf{};
-	std::size_t m_head = 0, m_tail = 0, m_len = 0;
+	uint16_t m_head = 0, m_tail = 0, m_len = 0;
 	bool m_last_was_mouse = false;
 };
+
+void unixpc_save_kbd(device_t &host, kbd_queue &queue);
 
 } // namespace unixpc
 

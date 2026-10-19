@@ -13,7 +13,15 @@
 // The hardware transfers 16-bit words while the selected controller asserts
 // DRQ. A per-slice budget keeps a full sector from monopolising the CPU.
 
+class device_t;
+
 namespace unixpc {
+
+// DMA count register: 14-bit count, bit 14 direction, bit 15 enable.
+// Pointer writes use A14 of the access to select the high half.
+inline constexpr uint16_t DMA_REG_ENABLE = 0x8000;
+inline constexpr uint16_t DMA_REG_READ = 0x4000;
+inline constexpr uint32_t DMA_PTR_HI_SEL = 0x4000;
 
 enum class dma_source : uint8_t
 {
@@ -96,6 +104,8 @@ public:
 			m_count = COUNT_MASK;
 	}
 
+	friend void unixpc_save_dma(device_t &host, dma_engine &engine);
+
 private:
 	uint32_t m_pointer = 0;
 	uint16_t m_count = 0;
@@ -103,6 +113,8 @@ private:
 	bool m_enabled = false;
 	dma_source m_source = dma_source::none;
 };
+
+void unixpc_save_dma(device_t &host, dma_engine &engine);
 
 } // namespace unixpc
 

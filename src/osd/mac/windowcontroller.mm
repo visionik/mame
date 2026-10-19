@@ -17,6 +17,8 @@
 
 // implemented in window.cpp
 extern "C" int MacRequestMachineExit();
+extern "C" int MacMouseIsUncaptured();
+extern "C" void MacRequestMouseRecapture();
 
 // implemented in modules/input/input_mac.cpp
 extern "C" void MacKeyboardEvent(int vk, int down);
@@ -188,6 +190,14 @@ static void HandleMouseButton(NSEvent *event, int button, bool down)
 	int x, y;
 	const bool inside = EventLocation(event, &x, &y);
 	NSWindow *window = [event window];
+
+	// Click in the window recaptures after IPT_UI_RELEASE_POINTER. Consume
+	// the press so the guest does not see a stray button down.
+	if (down && inside && button == 0 && MacMouseIsUncaptured())
+	{
+		MacRequestMouseRecapture();
+		return;
+	}
 
 	// Press the button only when the click lands in the content view, but
 	// always deliver releases to prevent stuck buttons.

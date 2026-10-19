@@ -694,6 +694,10 @@ inline void m68ki_rerun_expire()
 		m_rerun_count = 0;
 }
 
+/* RR set: one byte or word read is supplied from the data input buffer.
+ * The instruction input buffer, long reads, and writes are not handled.
+ * The 16 internal words are not restored, and RM is never set.
+ */
 inline void m68ki_rerun_supply(u32 pc, u16 ssw, u32 address, u16 dib)
 {
 	u32 size = (ssw & 0x0200) ? 1 : 2;
