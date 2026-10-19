@@ -193,8 +193,16 @@ The UPD7201 is at `$E50000`, low byte, control and data for two
 channels. Channel A is the RS-232 port (`-rs232`, guest `tty000`).
 Channel B is the modem. Its baud clock is the fixed 19.2 kHz only
 when MCR bit 12 is set (x16 is 1200, x64 is 300). There is no phone
-line. A read of the modem's second register (`$E62000`) is `0xFF`
-when no modem is installed.
+line.
+
+The on-board **882A** lives at `$E60000`. Register select is A15..A12.
+**RR2** (`$E62000`) is the presence/status byte: **`0xFF` means no modem**
+(default, matching FreeBee). Machine Configuration **On-board modem stub**
+or **`-modem`** / **`-nomodem`** (ini `modem`) makes RR2 report an idle
+present modem (`CTS|DSR|1200` = `0x15`), latches WR0/WR1/WR4–WR6/WR8/WR9,
+and clears LPSR “no dial tone” so Contiki can open `/dev/ph0` without the
+“can not be opened” dialog. Dial/answer and Diagnostic Disk Modem tests
+still have no phone line.
 
 The slot stays empty by default. With nothing plugged in, CTS and DCD
 are held ready so UNIX `tty000` still transmits. For the Diagnostic
@@ -391,7 +399,8 @@ continuous parity generation are not modeled.
 
 - EIA/RAM combo RAM size. The UART map is the same as the EIA-only card.
 - A RAM-only slot card. The 4 MB option already occupies `$200000`–`$3FFFFF`.
-- Phone line. Channel B has only its baud clock.
+- Phone line. Channel B has only its baud clock. `-modem` is a presence
+  stub for Contiki `/dev/ph0` open; not a real 882A / telephony path.
 - Third and fourth hard disks.
 - StarLAN, DOS-73, FloppyTape, QIC-02, the expansion chassis, Voice Power,
   and the PBX card.
