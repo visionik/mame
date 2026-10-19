@@ -13,6 +13,12 @@ namespace unixpc {
 inline constexpr int SCREEN_W = 720;
 inline constexpr int SCREEN_H = 348;
 inline constexpr int SCREEN_ROW_WORDS = SCREEN_W / 16;
+inline constexpr int SCREEN_HTOTAL = 896;
+inline constexpr int SCREEN_VTOTAL = 367;
+inline constexpr int WIN_VIEW_MASK = 3;
+inline constexpr char const *const WIN_VIEW_NAME[] = {
+	"1.5x (1080x522)", "2x (1440x696)", "2.5x (1800x870)", "3x (2160x1044)"
+};
 
 struct rgb8
 {

@@ -863,6 +863,12 @@ bool mac_osd_interface::should_hide_mouse()
 		return false;
 	}
 
+	// host pointer explicitly freed (IPT_UI_RELEASE_POINTER)
+	if (m_mouse_uncaptured)
+	{
+		return false;
+	}
+
 	// if neither mice nor lightguns are enabled in the core, then no
 	if (!options().mouse() && !options().lightgun())
 	{
@@ -877,6 +883,23 @@ bool mac_osd_interface::should_hide_mouse()
 
 	// otherwise, yes
 	return true;
+}
+
+void mac_osd_interface::toggle_mouse_uncapture()
+{
+	m_mouse_uncaptured = !m_mouse_uncaptured;
+	machine().ui().popup_time(1, m_mouse_uncaptured
+		? "Mouse released — click window to capture"
+		: "Mouse captured");
+}
+
+void mac_osd_interface::clear_mouse_uncapture()
+{
+	if (m_mouse_uncaptured)
+	{
+		m_mouse_uncaptured = false;
+		machine().ui().popup_time(1, "Mouse captured");
+	}
 }
 
 void mac_osd_interface::process_events_buf()
