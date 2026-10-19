@@ -18,6 +18,8 @@
 // Logical addresses below 0x080000 are kernel space for user-mode accesses.
 // Addresses at or above 0x400000 are not translated by this mapper.
 
+class device_t;
+
 namespace unixpc {
 
 enum class access : uint8_t
@@ -67,6 +69,8 @@ public:
 			m_map[page & (PAGE_COUNT - 1)] = value;
 	}
 
+	friend void unixpc_save_mapper(device_t &host, mapper &map);
+
 	static uint16_t page_index(uint32_t logical)
 	{
 		return uint16_t((logical >> PAGE_SHIFT) & (PAGE_COUNT - 1));
@@ -87,10 +91,17 @@ public:
 	probe check(uint32_t logical, bool write, bool supervisor, bool dma) const
 	{
 		probe p;
+		// I/O / ROM / expansion (≥ 4 MiB): supervisor and DMA may touch it.
+		// User gets a privilege fault, except VIDPAL user VRAM ($420000–$427FFF).
 		if (logical >= RAM_WINDOW)
 		{
-			p.result = access::privileged;
 			p.physical = logical;
+			if (dma || supervisor)
+				p.result = access::ok;
+			else if (m_vidpal && logical >= 0x420000 && logical <= 0x427fff)
+				p.result = access::ok;
+			else
+				p.result = access::privileged;
 			return p;
 		}
 
@@ -158,7 +169,12 @@ private:
 
 	uint16_t *m_map = nullptr;
 	bool m_vidpal = false;
+
+	// m_map is rebound in machine_start. The 1024 entries live in the
+	// mapram share, which the memory system already saves.
 };
+
+void unixpc_save_mapper(device_t &host, mapper &map);
 
 } // namespace unixpc
 

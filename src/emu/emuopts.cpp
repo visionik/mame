@@ -211,6 +211,7 @@ const options_entry emu_options::s_option_entries[] =
 	{ OPTION_LANGUAGE ";lang",                           "",          core_options::option_type::STRING,     "set UI display language" },
 	{ OPTION_NVRAM_SAVE ";nvwrite",                      "1",         core_options::option_type::BOOLEAN,    "save NVRAM data on exit" },
 	{ OPTION_RTC_TIME,                                   nullptr,     core_options::option_type::STRING,     "start emulation with time" },
+	{ OPTION_UNIXPC_PARITY,                              "0",         core_options::option_type::BOOLEAN,    "UNIX PC: emulate RAM parity (BPPLUS/PIE); overrides Machine Configuration when set" },
 
 	{ nullptr,                                           nullptr,     core_options::option_type::HEADER,     "SCRIPTING OPTIONS" },
 	{ OPTION_AUTOBOOT_COMMAND ";ab",                     nullptr,     core_options::option_type::STRING,     "command to execute after machine boot" },

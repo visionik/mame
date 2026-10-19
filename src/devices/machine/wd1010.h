@@ -42,6 +42,9 @@ public:
 	void brdy_w(int state);
 	void sc_w(int state);
 
+	// Host drive select is outside SDH. A missing image is ID-not-found.
+	void id_not_found();
+
 	// actually inputs to the controller from the drive
 	int sc_r();
 	int tk000_r();

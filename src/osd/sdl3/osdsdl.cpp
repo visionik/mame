@@ -468,6 +468,10 @@ bool sdl_osd_interface::should_hide_mouse()
 	if (machine().paused())
 		return false;
 
+	// host pointer explicitly freed (IPT_UI_RELEASE_POINTER)
+	if (m_mouse_uncaptured)
+		return false;
+
 	// if neither mice nor lightguns are enabled in the core, then no
 	if (!options().mouse() && !options().lightgun())
 		return false;
@@ -477,6 +481,23 @@ bool sdl_osd_interface::should_hide_mouse()
 
 	// otherwise, yes
 	return true;
+}
+
+void sdl_osd_interface::toggle_mouse_uncapture()
+{
+	m_mouse_uncaptured = !m_mouse_uncaptured;
+	machine().ui().popup_time(1, m_mouse_uncaptured
+		? "Mouse released — click window to capture"
+		: "Mouse captured");
+}
+
+void sdl_osd_interface::clear_mouse_uncapture()
+{
+	if (m_mouse_uncaptured)
+	{
+		m_mouse_uncaptured = false;
+		machine().ui().popup_time(1, "Mouse captured");
+	}
 }
 
 
@@ -609,6 +630,14 @@ void sdl_osd_interface::process_events()
 				auto const window = window_from_id(event.button.windowID);
 				if (!window)
 					break;
+
+				// Click in the window recaptures after IPT_UI_RELEASE_POINTER.
+				// Consume the press so the guest does not see a stray button.
+				if (event.button.down && event.button.button == 1 && m_mouse_uncaptured)
+				{
+					clear_mouse_uncapture();
+					break;
+				}
 
 				unsigned device;
 				try
@@ -869,6 +898,14 @@ void sdl_osd_interface::check_osd_inputs()
 
 	if (inp.pressed(IPT_OSD_8))
 		window->renderer().record();
+
+	// Free the host pointer without pausing. Drivers (e.g. unixpc) bind a
+	// key to IPT_UI_RELEASE_POINTER; use ioport edge detect so it works
+	// whether or not UI presses are enabled.
+	bool const release = machine().ioport().type_pressed(IPT_UI_RELEASE_POINTER);
+	if (release && !m_release_pointer_held)
+		toggle_mouse_uncapture();
+	m_release_pointer_held = release;
 }
 
 

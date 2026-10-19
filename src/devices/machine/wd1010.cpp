@@ -340,6 +340,13 @@ int wd1010_device::get_lbasector()
 //  INTERFACE
 //**************************************************************************
 
+void wd1010_device::id_not_found()
+{
+	set_intrq(0);
+	set_error(ERR_ID);
+	end_command();
+}
+
 void wd1010_device::drdy_w(int state)
 {
 	if (state)

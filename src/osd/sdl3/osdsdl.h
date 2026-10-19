@@ -164,6 +164,12 @@ public:
 	bool should_hide_mouse();
 	void process_events_buf();
 
+	// Sticky host-pointer free without pausing. IPT_UI_RELEASE_POINTER
+	// toggles this; a click in the game window clears it so capture returns.
+	bool mouse_uncaptured() const { return m_mouse_uncaptured; }
+	void toggle_mouse_uncapture();
+	void clear_mouse_uncapture();
+
 	virtual sdl_options &options() override { return m_options; }
 
 	virtual void process_events() override;
@@ -205,6 +211,9 @@ private:
 	bool m_enable_touch;
 	unsigned m_next_ptrdev;
 	std::vector<std::pair<SDL_TouchID, unsigned> > m_ptrdev_map;
+
+	bool m_mouse_uncaptured = false;
+	bool m_release_pointer_held = false;
 };
 
 //============================================================
