@@ -249,6 +249,10 @@ byte plus its complement is 0.
 | `+0x3FFFD` | Two's complement of the low byte |
 | `+0x3FFFF` | Two's complement of the high byte |
 
+The CPU samples those odd addresses. The emulated expansion map is
+16-bit, so the card handler sees the even word base and still returns
+`0xff00 | byte` so D7–D0 (odd address) carry the identity or MAC octet.
+
 A write anywhere in `+0x3FFF8` through `+0x3FFFF` resets the card.
 
 | Card | 16-bit id | Low, high, low complement, high complement |
@@ -299,16 +303,292 @@ bit. A card reset drops the request with the chip.
 
 | Offset | Register |
 |---|---|
-| `+0` | LANCE data port |
-| `+2` | LANCE address port. The driver writes it, waits two instructions, then uses the data port |
+| `+0` | LANCE data port (RDP). A **read** captures into the data latch (this cycle returns open bus); a **write** goes to the chip |
+| `+2` | LANCE address port (RAP). Same latch-on-read as RDP. The driver writes RAP, waits, then uses RDP |
 | `+4` | Control. Read clears the board interrupt. The driver writes `5` once |
-| `+6` | Status-ring address on write. The stored word is the byte address shifted right by 9. The data latch shares this address. The driver never reads it |
+| `+6` | Data latch on **read** (value captured by the previous RDP/RAP read). Status-ring address on **write** (byte address >> 9) |
 | `+0x3FFCB` … `+0x3FFC1` | Station address, six odd bytes, octet 0 at the top |
 
 Control bits: D0 DMA enable, D1 is 0 for Ethernet and 1 for the other
 interface, D2 is 1 for interrupt level 1 and 0 for level 5, D3 spare.
 The value `5` is DMA on, Ethernet selected, level 1. The emulated
 station address is the local address `02:00:00:3b:00:01`.
+
+### WIN/3B driver reverse notes (`ether` / `if_ether.c`)
+
+Kernel `slotinit` (`/unix`, `0x7592`) walks eight windows from `$C00000`
+through `$DC0000`. For each window it writes a word at `base+0x3FFF8`
+(card reset), then reads four **odd** identity bytes into `slots[]`
+(`0x25e3c`, eight records of four bytes: lo, hi, lō, hī). `getslot(id)`
+(`0x75de`) matches `id` low/high against those bytes and the
+complements summing to zero, then returns `0xC00000 + (index << 18)`.
+
+The loadable driver `configure` table has one entry: `enprobe` /
+`enattach` for unit 0. `enprobe` calls `getslot(0x1003)`. On success it
+stores window-relative pointers (RDP/RAP/CTL/latch at `+0/+2/+4/+6`,
+reset block at `+0x3FFF8`, MAC base at `+0x3FFCA`) and copies six MAC
+octets from odd addresses `+0x3FFCB` downward by two to `+0x3FFC1`.
+`enattach` builds an `ifnet` named `en` (so `en0`), MTU `0x5dc`
+(1500), and hooks `eninit` / `enoutput` / `enioctl` / `enrelease` via
+`if_attach`.
+
+`/etc/.drvload` runs `./ether.rc` after a successful `lddrv -av ether`.
+Stock `ether.rc` does `ifconfig en0 \`uname -n\``. If the node name is
+still `UNIXPC` (not a usable address), ifconfig prints `UNIXPC: bad
+value` and `.drvload` **unloads** the driver. This `ifconfig` also has
+no `-a`; that flag is treated as an interface name and yields
+`SIOCGIFFLAGS: no such interface`. Use `ifconfig en0` / `netstat -i`.
+
+Working guest config for this tree: `/etc/hosts` entry
+`192.168.9.50 mame3b1`, `ether.rc` using `IPADDR=192.168.9.50`, and
+`mkdir -p /usr/spool/mqueue` so the sendmail line in `ether.rc` does
+not fail the script.
+
+
+### WIN/3B board datapath (RE)
+
+Constants in the linked driver: **32** RX/TX descriptors (`nbufs=0x20`),
+**128**-byte buffers (`bufsize=0x80`). `getlog` maps those to LANCE ring
+length codes 5 and 7.
+
+#### Register helpers
+
+`setreg(csr, value)` writes RAP (`+2`) then RDP (`+0`) with two `nop`s
+between. Writes go straight to the LANCE (no latch). CSR reads in this
+driver do **not** use the latch path for the interrupt loop; they consume
+a **board status ring** instead.
+
+`enrelease` clears a word at `+0x3FFF8` (card reset) and deregisters the
+IRQ. `enreset(unit)` is a thin wrapper that calls `eninit`.
+
+#### `eninit` (bring LANCE online)
+
+Requires an interface address already present (`softc+0x18+4` non-zero);
+`ifconfig` therefore calls into ioctl/`ensetaddr` before init can finish.
+
+1. `getlog(32)` / `getlog(128)` → ring-length fields for the init block.
+2. Card reset: `clr.w` at `+0x3FFF8`.
+3. `setreg(1, InitBlock & 0xffff)` then `setreg(2, InitBlock >> 16)` —
+   CSR1/CSR2 = init-block address.
+4. `setreg(3, 6)` — CSR3 = `ACON|BSWP` (byte swap for big-endian host).
+5. Carve the `0x3000`-byte DMA arena from `enprobe`:
+   - `[0, 0x400)` status-ring words, primed to `0xFFFF`
+   - then 32 RX descriptors × 8 bytes
+   - then 32 TX descriptors × 8 bytes
+   - then packet buffers (128 bytes each)
+6. Program the board status-ring base: store `(dma_base >> 9)` to `+6`
+   (latch/status-ring port).
+7. Build classic LANCE init block at `InitBlock` (`0x3795f4`): mode 0,
+   PADR from the six MAC bytes (word-swapped pairs), LADRF from the
+   logical-address filter, RDRA/TDRA with length codes in the high bits.
+8. `NextCSR` ← status-ring base.
+9. Control port `+4` ← `5` (DMA enable, Ethernet, IRQ level 1).
+10. `setreg(0, 0x43)` — CSR0 = `INIT|STRT|INEA`.
+11. Set `IFF_UP|IFF_RUNNING` (`0x41`), `if_rtinit`, `arpwhohas`.
+
+Descriptor format used in the rings (8 bytes, LANCE RMD/TMD with BSWP):
+
+| Off | RX | TX |
+|---|---|---|
+| +0 | buffer address low | buffer address low |
+| +2 | addr high in low byte; `OWN=0x8000` when given to chip | same; STP/ENP bits set by `enstart` |
+| +4 | `−bufsize` (BCNT) | BCNT (`−nbytes`) |
+| +6 | MCNT (0 until chip fills) | TMD3 / error bits |
+
+#### Transmit path
+
+`enoutput` → ARP resolve (`arpresolve`) for AF_INET → prepend 14-byte
+Ethernet header (dst/src/type) onto an `mbuf` chain → queue on
+`softc` output list → `enstart`.
+
+`enstart` dequeues one mbuf, calls `enput` to copy bytes into the next
+owned TX buffer (may span multiple 128-byte descriptors), sets
+`OWN|STP|ENP` (`0x8200` / per-seg `0x8000` + ENP on last), advances the
+TX producer pointer (`0x3795dc`).
+
+#### Interrupt / receive path
+
+Board posts LANCE CSR0 snapshots into the status ring (empty = `0xFFFF`).
+`enintr`:
+
+1. If `*NextCSR == 0xFFFF`, no work.
+2. Read control port (clears board IRQ).
+3. Drain status words; high byte classifies the event:
+   - `0x04xx` — receive → `enrint`
+   - `0x02xx` — transmit complete / reclaim TX descriptors
+   - `0x01xx` — ignore / continue
+   - other — `"Bad CSR on interrupt"` and often `enreset`
+4. Advance `NextCSR` by 2, wrap after `0x400` bytes; rewrite slot to
+   `0xFFFF`.
+
+`enrint` walks RX descriptors until `OWN` is clear, reads MCNT, calls
+`enget` to build an mbuf chain from the buffer address, returns the
+descriptor to the chip (`OWN|0x8000`), then demux: EtherTypes `0x800` /
+`0x806` → IP input queue / `arpinput`. Missing ENP → `"RX_ENP not found"`.
+
+#### `enioctl` / address
+
+Recognizes `0x1020690c` (set address) and `0x10206910` (flags/up). Set
+address copies the `ifreq` into softc via `ensetaddr` (also fills
+`in_netof` / `in_lnaof` / broadcast), registers the IRQ once
+(`0x377b1a` armed flag), then `eninit`. Down path calls `enrelease`.
+
+#### Softc / globals (linked at `0x367000`)
+
+| Addr | Role |
+|---|---|
+| `0x37960c`…`618` | RDP, RAP, CTL, status-ring port |
+| `0x379620` | reset (`+0x3FFF8`) |
+| `0x379628` / `62c` | MAC base / 6-byte copy |
+| `0x3795f4` | InitBlock |
+| `0x3795d0` / `5d4` | RX / TX descriptor rings |
+| `0x3795d8` / `5dc` / `5e0` | RX consumer / TX producer / TX reclaim |
+| `0x379644` / `648` | status-ring base / `NextCSR` |
+| `0x37964c` | DMA arena pointer |
+| `0x379650` | `en_softc` (stride `0x7e`) |
+
+#### Emulator status-ring behaviour
+
+On AM7990 `/INTR` assert (active low), the card copies CSR0 into the next
+status-ring word with `INTR` and combinatorial `ERR` cleared, advances a
+0x400-byte producer, clears the LANCE cause bits (so `/INTR` drops), and
+raises the board IRQ. `enintr` drains that ring after reading the control
+port and matches the status **high byte exactly** (`0x01` IDON, `0x02`
+TINT, `0x04` RINT, `0x10` MISS, …). Combined high bytes such as `0x94`
+(`ERR|MISS|RINT`) take `"Bad CSR on interrupt"` → `enreset` and wedge RX.
+
+So the emulator: (1) does not set `RINT` on MISS in am7990; (2) strips
+`ERR` and priority-encodes a single cause into the snap; (3) suppresses
+MISS-only status posts (MISS does not run `enrint`, and a MISS storm
+overwrites pending RINT/TINT words).
+
+Verified live: boot `.drvload`/`ether.rc` → `eninit` raises IDON;
+emulator logs `enet: status-ring post …`; guest drains the slot back to
+`0xFFFF`; `en0` stays up; repeated telnet connect/login no longer wedges.
+
+LANCE DMA must translate guest **logical** addresses through the MMU
+(same as disk DMA). Treating them as physical made INIT read garbage and
+left TX descriptors with `OWN` stuck forever. Clearing CSR0 cause bits
+must also keep `INEA` set — a write with `INEA` clear disables further
+board IRQs and drops the following TINT snapshot.
+
+Lua dump: `/tmp/unixpc_ring_dump_request` → `/tmp/unixpc_status_ring.txt`.
+
+### WIN/3B networking recipe (this tree)
+
+Goal: boot UNIX 3.51 with Wollongong WIN/3B so guest `en0` is up as
+`mame3b1` and peer ICMP/TCP work through host `pcap`.
+
+Preferred Darwin path is a peered `feth` pair (avoids WiFi foreign-MAC
+limits). LAN-on-`en0` still works for broadcast ARP; unicast needs wired
+Ethernet or the feth recipe below.
+
+#### Launch (feth / host↔guest, recommended on macOS WiFi)
+
+```
+# one-time (admin): create the pair and host address
+sudo ifconfig feth0 create; sudo ifconfig feth1 create
+sudo ifconfig feth0 peer feth1; sudo ifconfig feth1 peer feth0
+sudo ifconfig feth0 up; sudo ifconfig feth1 up
+sudo ifconfig feth0 inet 192.168.9.1 netmask 255.255.255.0
+# guest ether.rc / hosts use IPADDR=192.168.9.50
+# chmod bpf if needed: sudo chmod g+rw /dev/bpf*; sudo chgrp admin /dev/bpf*
+
+# cfg/3b1.cfg: <device tag=":exp1:ethernet:lance" interface=N mac="02:00:00:3b:00:01"/>
+# N = index of feth1 from ./unixpc -listnetwork
+
+./unixpc 3b1 \
+  -hard roms/3b1/3b1.hd \
+  -rs232 pty \
+  -modem \
+  -exp1 ethernet \
+  -networkprovider pcap \
+  -autoboot_script roms/3b1/snapview.lua
+```
+
+Host checks after ether autoload (~2–3 min): `ping 192.168.9.50`,
+`nc -vz 192.168.9.50 23` / `21`. Save: `sta/3b1/win3b.sta`.
+
+Without `pcap` (provider `none`), TX still completes (LCAR then guest
+reclaim) and `netstat` Opkts increments. Optional:
+`-printer printer -prin roms/3b1/printout.prn`. Do **not** attach
+`-rs232 loopback` for interactive Contiki/getty.
+
+The log line `RS-232 pty /dev/ttysN` is the host PTY. Agents stash it in
+`/tmp/unixpc_pty.path`. Wake getty with CR spam; log in as `root` with
+an empty password, terminal type `s4`. Avoid guest `/dev/kmem` /
+`/dev/mem` dumps — they can hang the shell; use the Lua triggers below.
+
+#### Guest files already on `3b1.hd`
+
+| Path | Role |
+|---|---|
+| `/etc/lddrv/ether.o` | WIN/3B driver (~111448 bytes on 3.51) |
+| `/etc/lddrv/ether.rc` | `IPADDR=192.168.9.50` (feth) or LAN IP, `HOSTNAME=mame3b1`, daemons |
+| `/etc/lddrv/drivers` | must list `ether` (with `lipc`) so `.drvload` autoloads |
+| `/etc/hosts` | matching `mame3b1` IP plus localhost |
+| `/usr/spool/mqueue` | directory present so `ether.rc` sendmail line is safe |
+| `/usr/bin/telnet`, `/usr/bin/ftp`, `/usr/ethernet/…` | userland |
+
+Stock `ether.rc` used `ifconfig en0 \`uname -n\``. With `uname -n` still
+`UNIXPC` that fails and `.drvload` unloads ether — the guest copy above
+uses a literal `IPADDR` instead.
+
+#### Fresh install (only if the HD lacks WIN/3B)
+
+Package: `roms/3b1/ethernet/ETHERNET+IN` (also under guest
+`/usr/spool/uucppublic/ETHERNET+IN`). **Omit `cpio -B`** — that record
+size truncates `new/etc/lddrv/ether.o` (111448 → 106496).
+
+```
+mkdir /tmp/installed && cd /tmp/installed
+cpio -icduvm < /usr/spool/uucppublic/ETHERNET+IN
+chmod +x Install Remove
+# Contiki Office → UNIX window for ./Install (shform); or finish by hand:
+cp new/etc/lddrv/ether.o /etc/lddrv/ether.o   # confirm size 111448
+# edit ether.rc / hosts as above; echo ether >> /etc/lddrv/drivers
+mkdir -p /usr/spool/mqueue
+```
+
+#### Verify after boot
+
+```
+/etc/lddrv/lddrv -sv          # ether ALLOC at ~0x367000
+/usr/bin/ifconfig en0         # 192.168.9.50 flags=63<UP,…,RUNNING>
+/usr/bin/netstat -in          # en0 + lo0 (no ifconfig -a on this ifconfig)
+```
+
+If ether is loaded but `en0` is missing, re-run
+`/usr/bin/ifconfig en0 192.168.9.50 arp -trailers` (or `./ether.rc`).
+
+Host-side Lua (snapview): touch `/tmp/unixpc_exp_dump_request` for slot
+identity/MAC; `/tmp/unixpc_ring_dump_request` for softc + status ring →
+`/tmp/unixpc_status_ring.txt`; `/tmp/unixpc_type_request` for natkeyboard
+post. With `-verbose`, IDON posts log as
+`enet: status-ring post csr0=01c3 snap=0143 @…`.
+
+Wire MAC is `02:00:00:3b:00:01` (init-block `put_u16le` of PROM
+`01:00:3b:00:00:02`). Put that MAC in `cfg/3b1.cfg` so pcap installs a
+matching BPF filter before open.
+
+Verified (Darwin feth): `ping 192.168.9.50` 0% loss; TCP 23/21 open;
+telnet banner `UNIX System V (TWG-TCP/IP) (mame3b1)`; FTP
+`220 mame3b1 FTP server (Version 1.2 Jul 07 1986)`. Save:
+`sta/3b1/win3b.sta`.
+
+#### Known gaps / Darwin notes
+
+- Host `netdev` defaults to `none` unless `-networkprovider pcap`. BPF
+  `/dev/bpf*` is root-only; `chmod g+rw /dev/bpf*` (admin) or sudo /
+  ChmodBPF. Bind LANCE via `cfg/3b1.cfg` `<network>` `interface=` from
+  `-listnetwork`.
+- macOS WiFi `en0` does not deliver foreign-MAC unicast into BPF. Use the
+  feth recipe (above), a wired NIC, or Thunderbolt Ethernet for ICMP/TCP.
+- am7990 RX pads to 60 and appends FCS for tap/pcap frames (host stacks
+  omit FCS; without that the C-LANCE CRC error bit drops every packet).
+- Contiki graphics login is separate from the serial PTY getty; Contiki
+  screen redraws can flood the PTY — prefer short marker commands or
+  `/tmp/unixpc_type_request`.
 
 ### Expansion RAM
 

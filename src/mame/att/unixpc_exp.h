@@ -73,8 +73,13 @@ protected:
 private:
 	void irq_w(int state);
 	void publish_irq();
+	// Returns true if a status-ring word was posted (and board IRQ should rise).
+	bool post_status_csr0();
+	// If guest NextCSR sees 0xFFFF but our producer drifted, resync and
+	// optionally plant a RINT so enrint drains completed RX descriptors.
+	bool sync_status_ring_prod(bool plant_rint);
 	u16 dma_r(offs_t offset);
-	void dma_w(offs_t offset, u16 data);
+	void dma_w(offs_t offset, u16 data, u16 mem_mask = ~0);
 
 	required_device<am7990_device> m_lance;
 	required_device<input_merger_device> m_irq;
@@ -82,7 +87,7 @@ private:
 	required_device<m68010_device> m_cpu;
 	unixpc::enet_board m_board;
 	uint8_t m_mac[6];
-	bool m_lance_level = false;
+	bool m_lance_level = false; // true while AM7990 /INTR is asserted (active low)
 };
 
 class unixpc_exp_device : public device_t, public device_slot_interface

@@ -78,17 +78,23 @@ inline constexpr int exp_irq_bit(int slot)
 inline constexpr uint16_t ENET_ID = 0x1003;
 
 // Low byte of the identity word at this offset, or -1.
+//
+// Identity lives on the odd addresses. The expansion I/O handler is a
+// 16-bit map entry, so it always receives the even word base (offset & ~1).
+// Match either form so a word read that covers the odd byte still returns
+// the id in D7-D0 (0xff00 | id), which is what the slot walk samples.
 inline constexpr int exp_id_byte(uint16_t id, uint32_t offset)
 {
 	uint8_t const lo = uint8_t(id);
 	uint8_t const hi = uint8_t(id >> 8);
-	if (offset == EXP_ID_LO)
+	uint32_t const addr = offset | 1u;
+	if (addr == EXP_ID_LO)
 		return lo;
-	if (offset == EXP_ID_HI)
+	if (addr == EXP_ID_HI)
 		return hi;
-	if (offset == EXP_ID_LO_COMP)
+	if (addr == EXP_ID_LO_COMP)
 		return int(uint8_t(0u - lo));
-	if (offset == EXP_ID_HI_COMP)
+	if (addr == EXP_ID_HI_COMP)
 		return int(uint8_t(0u - hi));
 	return -1;
 }
