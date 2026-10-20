@@ -171,6 +171,11 @@ private:
 	// internal loopback buffer
 	u8 m_lb_buf[36];
 	int m_lb_length;
+
+	// Host tap/pcap omit the Ethernet FCS and may deliver unpadded frames.
+	// Staging buffer used to pad to 60 bytes and append a valid FCS before
+	// the C-LANCE receive path runs its residue check.
+	u8 m_rx_ext_buf[1518];
 };
 
 class am7990_device : public am7990_device_base

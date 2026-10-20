@@ -166,6 +166,21 @@ int am7990_device_base::recv_start_cb(u8 *buf, int length)
 		return 0;
 	}
 
+	// Host tap/pcap omit FCS and may hand us unpadded frames. The C-LANCE
+	// path expects a >=64-byte frame including FCS (see transmit append_fcs).
+	// Pad to 60 and append a CRC so the residue check matches real silicon
+	// receiving from a PHY that keeps the FCS.
+	if (length > 0 && length + 4 <= int(sizeof(m_rx_ext_buf)))
+	{
+		memcpy(m_rx_ext_buf, buf, length);
+		while (length < 60)
+			m_rx_ext_buf[length++] = 0;
+		u32 const crc = util::crc32_creator::simple(m_rx_ext_buf, length);
+		put_u32le(&m_rx_ext_buf[length], crc);
+		length += 4;
+		buf = m_rx_ext_buf;
+	}
+
 	// discard runt packets
 	if (length < 64)
 	{
@@ -282,9 +297,14 @@ void am7990_device_base::recv_complete_cb(int result)
 {
 	switch (result)
 	{
-	case -2: // missed packet
-		m_csr[0] |= CSR0_ERR | CSR0_MISS;
-		break;
+	case -2: // missed packet — MISS/ERR/INTR only (not RINT)
+		// RINT means a descriptor was filled. Raising RINT on MISS makes
+		// CSR0 look like ERR|MISS|RINT (high byte 0x94). WIN/3B enintr
+		// classifies status-ring snaps by exact high byte (0x01/0x04/0x10/…)
+		// and treats 0x94 as "Bad CSR" → enreset, which wedges the RX ring.
+		m_csr[0] |= CSR0_ERR | CSR0_MISS | CSR0_INTR;
+		update_interrupts();
+		return;
 
 	case -1: // packet discarded or filtered
 		return;

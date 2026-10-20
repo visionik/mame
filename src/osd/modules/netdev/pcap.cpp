@@ -15,6 +15,7 @@
 
 #include "util/strformat.h" // string_format
 
+#include <cstdio>
 #include <memory>
 #include <vector>
 
@@ -136,14 +137,21 @@ private:
 	pcap_module &m_module;
 	pcap_t *m_p;
 #ifdef SDLMAME_MACOSX
+	// Busy LANs outrun a 32-deep ring before the guest LANCE polls; size
+	// must stay a power of two for the index mask below.
+	static constexpr int PKT_RING = 2048;
+	static constexpr int PKT_RING_MASK = PKT_RING - 1;
+	static constexpr int PKT_MAX = 1600;
+
 	pthread_t m_thread;
 	pcap_t *p;
 	uint8_t m_pktbuf[2048];
 
-	uint8_t m_packets[32][1600];
-	int m_packetlens[32];
+	uint8_t m_packets[PKT_RING][PKT_MAX];
+	int m_packetlens[PKT_RING];
 	std::atomic<int> m_head;
 	std::atomic<int> m_tail;
+	std::atomic<unsigned> m_drops;
 
 	static void pcap_handler(u_char *user, const struct pcap_pkthdr *h, const u_char *bytes);
 	static void *pcap_blocker(void *arg);
@@ -159,14 +167,17 @@ void pcap_module::netdev_pcap::pcap_handler(u_char *user, const struct pcap_pkth
 		return;
 
 	int const curr = ctx->m_head.load(std::memory_order_relaxed);
-	int const next = (curr + 1) & 0x1f;
+	int const next = (curr + 1) & PKT_RING_MASK;
 	if (ctx->m_tail.load(std::memory_order_acquire) == next)
 	{
-		printf("buffer full, dropping packet\n");
+		unsigned const n = ctx->m_drops.fetch_add(1, std::memory_order_relaxed) + 1;
+		if ((n & 0x3ff) == 1)
+			osd_printf_verbose("pcap: RX ring full, dropped %u packet(s)\n", n);
 		return;
 	}
-	memcpy(ctx->m_packets[curr], bytes, h->len);
-	ctx->m_packetlens[curr] = h->len;
+	int const len = (h->len < PKT_MAX) ? int(h->len) : PKT_MAX;
+	memcpy(ctx->m_packets[curr], bytes, len);
+	ctx->m_packetlens[curr] = len;
 	ctx->m_head.store(next, std::memory_order_release);
 }
 
@@ -204,19 +215,44 @@ pcap_module::netdev_pcap::netdev_pcap(pcap_module &module, const char *name, net
 		m_p = nullptr;
 		return;
 	}
-	// Avoid capturing our own outbound frames. On BSD-derived libpcap (macOS,
-	// FreeBSD) BPF captures both directions by default, which causes the guest
-	// to see its own ARP probes as remote conflicts over point-to-point virtual
-	// interfaces (feth, tap). Harmless on Linux (already the default).
-	if (m_module.pcap_setdirection_dl &&
-		(*m_module.pcap_setdirection_dl)(m_p, PCAP_D_IN) != 0)
+	// Keep both directions on shared adapters (en0): host-originated ARP/IP
+	// toward the guest is outbound on the host NIC and invisible with
+	// PCAP_D_IN. Exclude frames sourced from the guest MAC so injected TX
+	// does not loop back as a remote ARP conflict (the feth/tap case that
+	// motivated PCAP_D_IN).
 	{
-		osd_printf_warning("pcap_setdirection(PCAP_D_IN) failed on %s\n", name);
+		auto const &mac = handler.get_mac();
+		char filter[320];
+		if (mac[0] | mac[1] | mac[2] | mac[3] | mac[4] | mac[5])
+		{
+			snprintf(filter, sizeof(filter),
+				"not ether src %02x:%02x:%02x:%02x:%02x:%02x and (broadcast or multicast or ether dst %02x:%02x:%02x:%02x:%02x:%02x)",
+				mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+				mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+		}
+		else
+		{
+			snprintf(filter, sizeof(filter), "broadcast or multicast");
+		}
+		struct bpf_program fp;
+		if ((*m_module.pcap_compile_dl)(m_p, &fp, filter, 1, PCAP_NETMASK_UNKNOWN) == -1)
+		{
+			osd_printf_warning("pcap: compile filter '%s' failed on %s\n", filter, name);
+		}
+		else if ((*m_module.pcap_setfilter_dl)(m_p, &fp) == -1)
+		{
+			osd_printf_warning("pcap: setfilter '%s' failed on %s\n", filter, name);
+		}
+		else
+		{
+			osd_printf_verbose("pcap: filter on %s: %s\n", name, filter);
+		}
 	}
 
 #ifdef SDLMAME_MACOSX
 	m_head = 0;
 	m_tail = 0;
+	m_drops = 0;
 	p = m_p;
 	pthread_create(&m_thread, nullptr, &netdev_pcap::pcap_blocker, this);
 #endif
@@ -230,7 +266,7 @@ int pcap_module::netdev_pcap::send(void const *buf, int len)
 		return 0;
 	}
 	int ret = (*m_module.pcap_sendpacket_dl)(m_p, reinterpret_cast<const u_char *>(buf), len);
-	printf("sent packet length %d, returned %d\n", len, ret);
+	osd_printf_verbose("pcap: sent length %d, returned %d\n", len, ret);
 	return !ret ? len : 0;
 }
 
@@ -248,7 +284,7 @@ int pcap_module::netdev_pcap::recv_dev(uint8_t **buf)
 
 	memcpy(m_pktbuf, m_packets[curr], m_packetlens[curr]);
 	int ret = m_packetlens[curr];
-	m_tail.store((curr + 1) & 0x1f, std::memory_order_release);
+	m_tail.store((curr + 1) & PKT_RING_MASK, std::memory_order_release);
 	*buf = m_pktbuf;
 	return ret;
 #else

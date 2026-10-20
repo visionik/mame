@@ -172,6 +172,11 @@ void unixpc_enet_device::device_start()
 {
 	save_item(NAME(m_mac));
 	save_item(NAME(m_lance_level));
+	save_item(NAME(m_board.m_control));
+	save_item(NAME(m_board.m_ring));
+	save_item(NAME(m_board.m_ring_prod));
+	save_item(NAME(m_board.m_latch));
+	save_item(NAME(m_board.m_irq));
 }
 
 void unixpc_enet_device::device_reset()
@@ -197,30 +202,141 @@ void unixpc_enet_device::publish_irq()
 	}
 }
 
+bool unixpc_enet_device::sync_status_ring_prod(bool plant_rint)
+{
+	// WIN/3B softc NextCSR at 0x379648 (logical). When it points at 0xFFFF
+	// the ISR thinks the status ring is empty. If our producer has moved
+	// ahead, snaps between them are orphaned and RX descriptors never
+	// reclaim. Resync producer to the guest empty slot; optionally plant
+	// a RINT so enrint walks the RX ring once.
+	u32 const next = (u32(dma_r(0x379648)) << 16) | dma_r(0x37964a);
+	u32 const base = m_board.ring_address();
+	if (next < base || next >= base + unixpc::ENET_STATUS_RING_BYTES)
+		return false;
+	if (dma_r(next) != 0xffff)
+		return false;
+
+	u16 const guest_off = u16((next - base) & (unixpc::ENET_STATUS_RING_BYTES - 1));
+	if (m_board.ring_prod() != guest_off)
+	{
+		osd_printf_verbose("enet: status-ring resync prod %04x -> %04x\n",
+			m_board.ring_prod(), guest_off);
+		m_board.set_ring_prod(guest_off);
+	}
+	if (!plant_rint)
+		return false;
+	// take_status_slot writes at the resynced prod and advances past it
+	uint32_t const addr = m_board.take_status_slot();
+	dma_w(addr, 0x0473);
+	osd_printf_verbose("enet: planted RINT at %06x\n", addr);
+	return true;
+}
+
+bool unixpc_enet_device::post_status_csr0()
+{
+	if (!m_board.status_ring_armed())
+		return false;
+
+	address_space &space = m_cpu->space(AS_PROGRAM);
+	u16 const saved_rap = m_lance->regs_r(space, 1);
+	m_lance->regs_w(1, 0);
+	u16 const csr0 = m_lance->regs_r(space, 0);
+
+	// Cause bits that WIN/3B enintr actually demuxes into work. MISS alone
+	// is acknowledged by the driver but does not run enrint; a MISS storm
+	// would overwrite pending RINT/TINT status-ring words and the guest
+	// never reclaims RX descriptors. Clear MISS silently; if the RX ring
+	// is already full, wake enrint via a planted RINT at NextCSR.
+	u16 const causes = u16(csr0 & unixpc::ENET_CSR0_CLEAR);
+	u16 const work = u16(causes & ~unixpc::ENET_CSR0_MISS);
+	if (work == 0 && (causes & unixpc::ENET_CSR0_MISS))
+	{
+		u16 clear = unixpc::ENET_CSR0_MISS;
+		if (csr0 & unixpc::ENET_CSR0_INEA)
+			clear |= unixpc::ENET_CSR0_INEA;
+		m_lance->regs_w(0, clear);
+		m_lance->regs_w(1, saved_rap);
+		bool const woke = sync_status_ring_prod(true);
+		osd_printf_verbose("enet: MISS-only suppressed csr0=%04x wake=%d\n", csr0, woke ? 1 : 0);
+		return woke;
+	}
+
+	(void)sync_status_ring_prod(false);
+
+	// Board copies CSR0 into the status ring without INTR. WIN/3B enintr
+	// treats bit 7 as fatal and matches the high byte exactly
+	// (0x01/0x02/0x04/0x10/…). ERR is a combinatorial OR — strip it.
+	// If several cause bits are set, keep one by priority so 0x06
+	// (RINT|TINT) does not become "Bad CSR".
+	u16 snapshot = u16(csr0 & ~(unixpc::ENET_CSR0_INTR | unixpc::ENET_CSR0_ERR));
+	u16 const hi = u16(snapshot & 0xff00);
+	if (hi != 0)
+	{
+		u16 one = 0;
+		if (hi & 0x0400) one = 0x0400;      // RINT
+		else if (hi & 0x0200) one = 0x0200; // TINT
+		else if (hi & 0x0100) one = 0x0100; // IDON
+		else if (hi & 0x1000) one = 0x1000; // MISS
+		else if (hi & 0x4000) one = 0x4000; // BABL
+		else if (hi & 0x0800) one = 0x0800; // MERR
+		else if (hi & 0x2000) one = 0x2000; // CERR
+		else one = hi;
+		snapshot = u16((snapshot & 0x00ff) | one);
+	}
+	uint32_t const addr = m_board.take_status_slot();
+	dma_w(addr, snapshot);
+	u16 clear = u16(csr0 & unixpc::ENET_CSR0_CLEAR);
+	if (csr0 & unixpc::ENET_CSR0_INEA)
+		clear |= unixpc::ENET_CSR0_INEA;
+	m_lance->regs_w(0, clear);
+	m_lance->regs_w(1, saved_rap);
+	osd_printf_verbose("enet: status-ring post csr0=%04x snap=%04x @%06x prod=%04x\n",
+		csr0, snapshot, addr, m_board.ring_prod());
+	return true;
+}
+
 void unixpc_enet_device::irq_w(int state)
 {
-	bool const level = state != 0;
-	if (level && !m_lance_level)
-		m_board.raise_irq();
-	m_lance_level = level;
+	// AM7990 /INTR is active low: asserted when state == 0.
+	bool const asserted = (state == 0);
+	if (asserted)
+	{
+		if (!m_lance_level)
+		{
+			m_lance_level = true;
+			if (post_status_csr0())
+				m_board.raise_irq();
+		}
+	}
+	else
+		m_lance_level = false;
 	publish_irq();
 }
 
 u16 unixpc_enet_device::dma_r(offs_t offset)
 {
+	// LANCE addresses are guest logical; translate like disk DMA.
 	auto &host = *downcast<unixpc_state *>(&machine().root_device());
+	uint32_t const logical = uint32_t(offset) & ~1u;
+	unixpc::probe const p = host.m_mapper.translate(logical, false, true, true);
+	if (p.result != unixpc::access::ok)
+		return 0xffff;
 	uint32_t word = 0;
-	if (!host.ram_word(uint32_t(offset) & ~1u, false, word))
+	if (!host.ram_word(p.physical, false, word))
 		return 0xffff;
 	return host.m_ramptr[word];
 }
 
-void unixpc_enet_device::dma_w(offs_t offset, u16 data)
+void unixpc_enet_device::dma_w(offs_t offset, u16 data, u16 mem_mask)
 {
 	auto &host = *downcast<unixpc_state *>(&machine().root_device());
+	uint32_t const logical = uint32_t(offset) & ~1u;
+	unixpc::probe const p = host.m_mapper.translate(logical, true, true, true);
+	if (p.result != unixpc::access::ok)
+		return;
 	uint32_t word = 0;
-	if (host.ram_word(uint32_t(offset) & ~1u, true, word))
-		host.m_ramptr[word] = data;
+	if (host.ram_word(p.physical, true, word))
+		COMBINE_DATA(&host.m_ramptr[word]);
 }
 
 uint16_t unixpc_enet_device::exp_r(uint32_t offset)
@@ -232,10 +348,20 @@ uint16_t unixpc_enet_device::exp_r(uint32_t offset)
 	if (octet >= 0)
 		return uint16_t(0xff00 | m_mac[octet]);
 	address_space &space = m_cpu->space(AS_PROGRAM);
+	// Theory of Operation: a read of RDP or RAP does not return the
+	// LANCE value on that cycle — it is captured into the data latch.
+	// The next read of ENET_LATCH (+6) delivers it. Writes still go
+	// straight to the chip.
 	if (offset == unixpc::ENET_RDP)
-		return m_lance->regs_r(space, 0);
+	{
+		m_board.capture(m_lance->regs_r(space, 0));
+		return unixpc::IO_OPEN;
+	}
 	if (offset == unixpc::ENET_RAP)
-		return m_lance->regs_r(space, 1);
+	{
+		m_board.capture(m_lance->regs_r(space, 1));
+		return unixpc::IO_OPEN;
+	}
 	if (offset == unixpc::ENET_CTL)
 	{
 		uint16_t const value = m_board.read_control();
@@ -251,7 +377,13 @@ void unixpc_enet_device::exp_w(uint32_t offset, uint16_t data, uint16_t mem_mask
 {
 	if (unixpc::exp_reset_write(offset))
 	{
-		reset();
+		// Hardware board reset also holds the LANCE in STOP so CSR1–3/INIT
+		// work. Do not reset the LANCE from device_reset() — machine reset
+		// already walks children, and a second reset there raced timers.
+		m_board.reset();
+		m_lance_level = false;
+		m_lance->reset();
+		publish_irq();
 		return;
 	}
 	if (offset == unixpc::ENET_RDP)
