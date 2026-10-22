@@ -54,8 +54,7 @@ void network_manager::config_load(config_type cfg_type, config_level cfg_level, 
 				for (device_network_interface &network : network_interface_enumerator(machine().root_device()))
 				{
 					if (!strcmp(tag, network.device().tag())) {
-						int interface = node->get_attribute_int("interface", 0);
-						network.set_interface(interface);
+						// Apply MAC before open so pcap can install a dst-MAC BPF filter.
 						const char *mac_addr = node->get_attribute_string("mac", nullptr);
 						if (mac_addr != nullptr && strlen(mac_addr) == 17) {
 							uint8_t mac[6];
@@ -64,6 +63,8 @@ void network_manager::config_load(config_type cfg_type, config_level cfg_level, 
 							for (int i = 0; i<6; i++) mac[i] = mac_num[i];
 							network.set_mac(mac);
 						}
+						int interface = node->get_attribute_int("interface", 0);
+						network.set_interface(interface);
 
 					}
 				}

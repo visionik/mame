@@ -123,6 +123,7 @@ public:
 	void set_fpu_enable(bool enable);
 	bool get_fpu_enable() const { return m_has_fpu; }
 	void set_buserror_details(u32 fault_addr, u8 rw, u8 fc, bool rerun = false);
+	u16 get_access_sz() const noexcept { return m_mmu_tmp_sz; }
 	void restart_this_instruction();
 
 protected:

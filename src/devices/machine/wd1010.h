@@ -42,6 +42,9 @@ public:
 	void brdy_w(int state);
 	void sc_w(int state);
 
+	// Host drive select is outside SDH. A missing image is ID-not-found.
+	void id_not_found();
+
 	// actually inputs to the controller from the drive
 	int sc_r();
 	int tk000_r();
@@ -153,6 +156,11 @@ private:
 	uint8_t m_sdh;
 	uint8_t m_status;
 	uint8_t m_head;
+	// Task file is live; the in-flight command uses a snapshot. Host
+	// writes (and board HDSEL3) during CIP must not retarget the transfer.
+	uint16_t m_cur_cyl;
+	uint8_t m_cur_head;
+	uint8_t m_cur_sec;
 };
 
 // device type definition

@@ -60,6 +60,12 @@ public:
 	bool should_hide_mouse();
 	void process_events_buf();
 
+	// Sticky host-pointer free without pausing. IPT_UI_RELEASE_POINTER
+	// toggles this; a click in the game window clears it so capture returns.
+	bool mouse_uncaptured() const { return m_mouse_uncaptured; }
+	void toggle_mouse_uncapture();
+	void clear_mouse_uncapture();
+
 	// -video none runs behind a window that is never shown, so the menu bar
 	// and the Dock can still quit MAME without it ever taking focus
 	bool headless() const { return strcmp(m_options.video(), OSDOPTVAL_NONE) == 0; }
@@ -73,6 +79,8 @@ private:
 	void output_oslog(const char *buffer);
 
 	mac_options &m_options;
+	bool m_mouse_uncaptured = false;
+	bool m_release_pointer_held = false;
 };
 
 //============================================================

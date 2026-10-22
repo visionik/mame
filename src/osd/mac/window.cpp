@@ -118,6 +118,33 @@ extern "C" int MacRequestMachineExit()
 }
 
 //============================================================
+//  MacMouseIsUncaptured / MacRequestMouseRecapture
+//  Cocoa click-to-recapture while the host pointer is free
+//============================================================
+
+extern "C" int MacMouseIsUncaptured()
+{
+	if (osd_common_t::window_list().empty())
+	{
+		return 0;
+	}
+
+	auto &osd = downcast<mac_osd_interface &>(osd_common_t::window_list().front()->machine().osd());
+	return osd.mouse_uncaptured() ? 1 : 0;
+}
+
+extern "C" void MacRequestMouseRecapture()
+{
+	if (osd_common_t::window_list().empty())
+	{
+		return;
+	}
+
+	auto &osd = downcast<mac_osd_interface &>(osd_common_t::window_list().front()->machine().osd());
+	osd.clear_mouse_uncapture();
+}
+
+//============================================================
 //  MacOrderWindowsFront
 //  called when the application becomes active; windows shown
 //  before activation completed (fullscreen startup) may not

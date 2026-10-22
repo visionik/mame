@@ -180,6 +180,14 @@ void mac_osd_interface::check_osd_inputs()
 	{
 		window->renderer().record();
 	}
+
+	// Free the host pointer without pausing. The core does not act on
+	// IPT_UI_RELEASE_POINTER; drivers (e.g. unixpc) bind a key to it.
+	// Use ioport edge detect so it works whether or not UI presses are enabled.
+	bool const release = machine().ioport().type_pressed(IPT_UI_RELEASE_POINTER);
+	if (release && !m_release_pointer_held)
+		toggle_mouse_uncapture();
+	m_release_pointer_held = release;
 }
 
 //============================================================

@@ -354,6 +354,12 @@ bool harddisk_image_device::write(uint32_t lbasector, const void *buffer)
 	return m_hard_disk_handle->write(lbasector, buffer);
 }
 
+void harddisk_image_device::set_geometry(uint32_t cylinders, uint32_t heads, uint32_t sectors)
+{
+	if (m_hard_disk_handle)
+		m_hard_disk_handle->set_geometry(cylinders, heads, sectors);
+}
+
 
 bool harddisk_image_device::set_block_size(uint32_t blocksize)
 {

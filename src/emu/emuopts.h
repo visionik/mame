@@ -176,6 +176,12 @@
 #define OPTION_UI                   "ui"
 #define OPTION_NVRAM_SAVE           "nvram_save"
 #define OPTION_RTC_TIME             "rtc"
+// UNIX PC / 3B1: force RAM parity emulation (BPPLUS/PIE). When set on the
+// command line or in an ini, overrides Machine Configuration "RAM parity emulation".
+#define OPTION_UNIXPC_PARITY        "parity"
+// UNIX PC / 3B1: stub on-board 882A modem as present (RR2 != 0xFF). Overrides
+// Machine Configuration "On-board modem stub" when set.
+#define OPTION_UNIXPC_MODEM         "modem"
 
 // core comm options
 #define OPTION_COMM_LOCAL_HOST      "comm_localhost"
