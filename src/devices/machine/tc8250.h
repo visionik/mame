@@ -61,8 +61,6 @@ public:
 	void ce_w(int state);
 	void we_w(int state);
 
-	using tc8250::reg_t;
-
 protected:
 	// device-level overrides
 	virtual void device_start() override ATTR_COLD;
