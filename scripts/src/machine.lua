@@ -3845,6 +3845,19 @@ end
 
 ---------------------------------------------------
 --
+--@src/devices/machine/tc8250.h,MACHINES["TC8250"] = true
+---------------------------------------------------
+
+if MACHINES["TC8250"] then
+	files {
+		MAME_DIR .. "src/devices/machine/tc8250.cpp",
+		MAME_DIR .. "src/devices/machine/tc8250.h",
+		MAME_DIR .. "src/devices/machine/tc8250_core.h",
+	}
+end
+
+---------------------------------------------------
+--
 --@src/devices/machine/tdc1008.h,MACHINES["TDC1008"] = true
 ---------------------------------------------------
 
